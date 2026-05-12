@@ -1,0 +1,10 @@
+[package]
+name = "ptf_engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rust_decimal = { version = "1.36", features = ["std"] }
+chrono = { version = "0.4", features = ["std"] }
+uuid = { version = "1.11", features = ["v4"] }
+thiserror = "1.0"
