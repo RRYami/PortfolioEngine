@@ -41,4 +41,8 @@ pub enum DomainError {
     },
     #[error("transactions not in chronological order at index {0}")]
     UnorderedTransactions(usize),
+    #[error("no position found for instrument {0:?}")]
+    PositionNotFound(InstrumentId),
+    #[error("dividend on short position is not supported in v1: {0:?}")]
+    DividendOnShortPosition(InstrumentId),
 }
