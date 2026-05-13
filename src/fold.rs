@@ -66,39 +66,30 @@ fn apply(
             lot_override,
         } => {
             let total_cost = quantity * price.amount + fees.amount;
-            *state.cash.entry(price.currency).or_insert(Decimal::ZERO) -= total_cost;
-
-            // TODO: rounding behavior under fractional fee allocation.
             let cost_per_unit = price.amount + (fees.amount / quantity);
 
-            let position = state
-                .positions
-                .entry(*instrument)
-                .or_insert_with(|| Position::new(*instrument, price.currency));
-
-            if position.currency() != price.currency {
-                return Err(DomainError::CurrencyMismatch {
-                    expected: position.currency(),
-                    got: price.currency,
-                });
+            // --- Validation phase (no mutation) ---
+            if let Some(pos) = state.positions.get(instrument) {
+                if pos.currency() != price.currency {
+                    return Err(DomainError::CurrencyMismatch {
+                        expected: pos.currency(),
+                        got: price.currency,
+                    });
+                }
             }
 
-            let mut realized_pnl = Decimal::ZERO;
-            let mut remaining = *quantity;
-
-            // Cover existing short lots first.
-            let short_qty = position.total_short_quantity();
-
             if let Some(crate::lot_method::LotSelection::Specific(entries)) = lot_override {
-                // Specific selection: user names exact short lots to cover.
-                // Validate each entry first (existence, side, sufficient qty),
-                // then check the sum against the coverable quantity.
-                let cover_qty = remaining.min(short_qty);
+                let pos = state
+                    .positions
+                    .get(instrument)
+                    .ok_or(DomainError::LotNotFound(entries[0].lot_id))?;
+                let short_qty = pos.total_short_quantity();
+                let cover_qty = (*quantity).min(short_qty);
                 let mut specified = Decimal::ZERO;
                 for entry in entries {
-                    let lot = position
+                    let lot = pos
                         .lots
-                        .iter_mut()
+                        .iter()
                         .find(|l| l.id == entry.lot_id && l.side == LotSide::Short)
                         .ok_or(DomainError::LotNotFound(entry.lot_id))?;
                     if entry.quantity > lot.quantity {
@@ -116,6 +107,23 @@ fn apply(
                         tx: cover_qty,
                     });
                 }
+            }
+
+            // --- Mutation phase ---
+            *state.cash.entry(price.currency).or_insert(Decimal::ZERO) -= total_cost;
+
+            let position = state
+                .positions
+                .entry(*instrument)
+                .or_insert_with(|| Position::new(*instrument, price.currency));
+
+            let mut realized_pnl = Decimal::ZERO;
+            let mut remaining = *quantity;
+
+            let short_qty = position.total_short_quantity();
+
+            if let Some(crate::lot_method::LotSelection::Specific(entries)) = lot_override {
+                let cover_qty = remaining.min(short_qty);
                 for entry in entries {
                     let lot = position
                         .lots
@@ -195,39 +203,30 @@ fn apply(
             lot_override,
         } => {
             let total_proceeds = quantity * price.amount - fees.amount;
-            *state.cash.entry(price.currency).or_insert(Decimal::ZERO) += total_proceeds;
-
-            // TODO: rounding behavior under fractional fee allocation.
             let sale_price_per_unit = price.amount - (fees.amount / quantity);
 
-            let position = state
-                .positions
-                .entry(*instrument)
-                .or_insert_with(|| Position::new(*instrument, price.currency));
-
-            if position.currency() != price.currency {
-                return Err(DomainError::CurrencyMismatch {
-                    expected: position.currency(),
-                    got: price.currency,
-                });
+            // --- Validation phase (no mutation) ---
+            if let Some(pos) = state.positions.get(instrument) {
+                if pos.currency() != price.currency {
+                    return Err(DomainError::CurrencyMismatch {
+                        expected: pos.currency(),
+                        got: price.currency,
+                    });
+                }
             }
 
-            let mut realized_pnl = Decimal::ZERO;
-            let mut remaining = *quantity;
-
-            // Close existing long lots first.
-            let long_qty = position.total_long_quantity();
-
             if let Some(crate::lot_method::LotSelection::Specific(entries)) = lot_override {
-                // Specific selection: user names exact long lots to close.
-                // Validate each entry first (existence, side, sufficient qty),
-                // then check the sum against the closeable quantity.
-                let close_qty = remaining.min(long_qty);
+                let pos = state
+                    .positions
+                    .get(instrument)
+                    .ok_or(DomainError::LotNotFound(entries[0].lot_id))?;
+                let long_qty = pos.total_long_quantity();
+                let close_qty = (*quantity).min(long_qty);
                 let mut specified = Decimal::ZERO;
                 for entry in entries {
-                    let lot = position
+                    let lot = pos
                         .lots
-                        .iter_mut()
+                        .iter()
                         .find(|l| l.id == entry.lot_id && l.side == LotSide::Long)
                         .ok_or(DomainError::LotNotFound(entry.lot_id))?;
                     if entry.quantity > lot.quantity {
@@ -245,6 +244,23 @@ fn apply(
                         tx: close_qty,
                     });
                 }
+            }
+
+            // --- Mutation phase ---
+            *state.cash.entry(price.currency).or_insert(Decimal::ZERO) += total_proceeds;
+
+            let position = state
+                .positions
+                .entry(*instrument)
+                .or_insert_with(|| Position::new(*instrument, price.currency));
+
+            let mut realized_pnl = Decimal::ZERO;
+            let mut remaining = *quantity;
+
+            let long_qty = position.total_long_quantity();
+
+            if let Some(crate::lot_method::LotSelection::Specific(entries)) = lot_override {
+                let close_qty = remaining.min(long_qty);
                 for entry in entries {
                     let lot = position
                         .lots
@@ -378,7 +394,7 @@ fn sort_lots(lots: &mut Vec<&mut Lot>, method: LotMethod) {
 mod tests {
     use super::*;
     use crate::ids::{InstrumentId, TransactionId};
-    use crate::lot_method::LotMethod;
+    use crate::lot_method::{LotMethod, LotSelection, LotSelectionEntry};
     use crate::{Currency, Money};
     use chrono::NaiveDate;
     use rust_decimal::Decimal;
@@ -1058,7 +1074,7 @@ mod tests {
         let inst = instrument();
         let d = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
         let rev = TransactionKind::CorporateAction(
-            crate::transaction::CorporateAction::reverse_split(inst, Decimal::new(1, 1)).unwrap(),
+            crate::transaction::CorporateAction::reverse_split(inst, Decimal::from_str_exact("0.1").unwrap()).unwrap(),
         );
         let txs = vec![
             tx(d, TransactionKind::deposit(usd("1000.00")).unwrap()),
@@ -1296,8 +1312,8 @@ mod tests {
         let lot2_id = state.position(inst).unwrap().lots()[1].id;
 
         // Sell 5 shares specifically from lot2 ($60 lot), bypassing FIFO.
-        let specific = crate::lot_method::LotSelection::Specific(vec![
-            crate::lot_method::LotSelectionEntry {
+        let specific = LotSelection::Specific(vec![
+            LotSelectionEntry {
                 lot_id: lot2_id,
                 quantity: Decimal::from(5),
             },
@@ -1332,8 +1348,8 @@ mod tests {
         ];
         let mut state = fold(&txs, &cfg()).unwrap();
 
-        let specific = crate::lot_method::LotSelection::Specific(vec![
-            crate::lot_method::LotSelectionEntry {
+        let specific = LotSelection::Specific(vec![
+            LotSelectionEntry {
                 lot_id: LotId::new(),
                 quantity: Decimal::from(5),
             },
@@ -1358,8 +1374,8 @@ mod tests {
         let mut state = fold(&txs, &cfg()).unwrap();
         let lot_id = state.position(inst).unwrap().lots()[0].id;
 
-        let specific = crate::lot_method::LotSelection::Specific(vec![
-            crate::lot_method::LotSelectionEntry {
+        let specific = LotSelection::Specific(vec![
+            LotSelectionEntry {
                 lot_id,
                 quantity: Decimal::from(15),
             },
@@ -1391,8 +1407,8 @@ mod tests {
         let mut state = fold(&txs, &cfg()).unwrap();
         let lot_id = state.position(inst).unwrap().lots()[0].id;
 
-        let specific = crate::lot_method::LotSelection::Specific(vec![
-            crate::lot_method::LotSelectionEntry {
+        let specific = LotSelection::Specific(vec![
+            LotSelectionEntry {
                 lot_id,
                 quantity: Decimal::from(3),
             },
@@ -1421,8 +1437,8 @@ mod tests {
         let mut state = fold(&txs, &cfg()).unwrap();
         let short_lot_id = state.position(inst).unwrap().lots()[0].id;
 
-        let specific = crate::lot_method::LotSelection::Specific(vec![
-            crate::lot_method::LotSelectionEntry {
+        let specific = LotSelection::Specific(vec![
+            LotSelectionEntry {
                 lot_id: short_lot_id,
                 quantity: Decimal::from(3),
             },
@@ -1452,8 +1468,8 @@ mod tests {
         let mut state = fold(&txs, &cfg()).unwrap();
         let short_lot_id = state.position(inst).unwrap().lots()[0].id;
 
-        let specific = crate::lot_method::LotSelection::Specific(vec![
-            crate::lot_method::LotSelectionEntry {
+        let specific = LotSelection::Specific(vec![
+            LotSelectionEntry {
                 lot_id: short_lot_id,
                 quantity: Decimal::from(5),
             },
@@ -1488,7 +1504,7 @@ mod tests {
         let mut state = fold(&txs, &cfg()).unwrap();
 
         // Override portfolio FIFO with LIFO for this single sell.
-        let override_sel = crate::lot_method::LotSelection::Method(LotMethod::Lifo);
+        let override_sel = LotSelection::Method(LotMethod::Lifo);
         let sell = tx(d, TransactionKind::sell(inst, Decimal::from(5), usd("70.00"), usd("0.00"), Some(override_sel)).unwrap());
         apply(&mut state, &sell, &cfg()).unwrap();
 
@@ -1499,5 +1515,179 @@ mod tests {
         assert_eq!(pos.lots()[0].basis_per_unit().amount, Decimal::from(50));
         assert_eq!(pos.lots()[1].quantity(), Decimal::from(5));
         assert_eq!(pos.lots()[1].basis_per_unit().amount, Decimal::from(60));
+    }
+
+    // ------------------------------------------------------------------
+    // Atomicity — state unchanged on validation failures
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sell_currency_mismatch_does_not_mutate_cash() {
+        let inst = instrument();
+        let d = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let txs = vec![
+            tx(d, TransactionKind::deposit(usd("1000.00")).unwrap()),
+            tx(
+                d,
+                TransactionKind::buy(inst, Decimal::from(10), usd("50.00"), usd("0.00"), None)
+                    .unwrap(),
+            ),
+        ];
+        let mut state = fold(&txs, &cfg()).unwrap();
+
+        let cash_before = state.cash_balance(Currency::USD);
+        let pos_qty_before = state.position(inst).unwrap().net_quantity();
+
+        let sell = tx(d, TransactionKind::sell(inst, Decimal::from(5), eur("80.00"), eur("0.00"), None).unwrap());
+        let result = apply(&mut state, &sell, &cfg());
+        assert!(matches!(result, Err(DomainError::CurrencyMismatch { .. })));
+
+        assert_eq!(state.cash_balance(Currency::USD), cash_before);
+        assert_eq!(state.cash_balance(Currency::EUR), Decimal::ZERO);
+        assert_eq!(state.position(inst).unwrap().net_quantity(), pos_qty_before);
+    }
+
+    #[test]
+    fn sell_specific_lot_not_found_does_not_mutate_cash() {
+        let inst = instrument();
+        let d = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let txs = vec![
+            tx(d, TransactionKind::deposit(usd("1000.00")).unwrap()),
+            tx(
+                d,
+                TransactionKind::buy(inst, Decimal::from(10), usd("50.00"), usd("0.00"), None)
+                    .unwrap(),
+            ),
+        ];
+        let mut state = fold(&txs, &cfg()).unwrap();
+
+        let cash_before = state.cash_balance(Currency::USD);
+        let pos_qty_before = state.position(inst).unwrap().net_quantity();
+
+        let specific = LotSelection::Specific(vec![LotSelectionEntry {
+            lot_id: LotId::new(),
+            quantity: Decimal::from(5),
+        }]);
+        let sell = tx(d, TransactionKind::sell(inst, Decimal::from(5), usd("70.00"), usd("0.00"), Some(specific)).unwrap());
+        let result = apply(&mut state, &sell, &cfg());
+        assert!(matches!(result, Err(DomainError::LotNotFound(_))));
+
+        assert_eq!(state.cash_balance(Currency::USD), cash_before);
+        assert_eq!(state.position(inst).unwrap().net_quantity(), pos_qty_before);
+    }
+
+    #[test]
+    fn sell_specific_quantity_mismatch_does_not_mutate_cash() {
+        let inst = instrument();
+        let d = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let txs = vec![
+            tx(d, TransactionKind::deposit(usd("1000.00")).unwrap()),
+            tx(
+                d,
+                TransactionKind::buy(inst, Decimal::from(10), usd("50.00"), usd("0.00"), None)
+                    .unwrap(),
+            ),
+        ];
+        let mut state = fold(&txs, &cfg()).unwrap();
+        let lot_id = state.position(inst).unwrap().lots()[0].id;
+
+        let cash_before = state.cash_balance(Currency::USD);
+        let pos_qty_before = state.position(inst).unwrap().net_quantity();
+
+        let specific = LotSelection::Specific(vec![LotSelectionEntry {
+            lot_id,
+            quantity: Decimal::from(3),
+        }]);
+        let sell = tx(d, TransactionKind::sell(inst, Decimal::from(5), usd("70.00"), usd("0.00"), Some(specific)).unwrap());
+        let result = apply(&mut state, &sell, &cfg());
+        assert!(matches!(result, Err(DomainError::LotQuantityMismatch { .. })));
+
+        assert_eq!(state.cash_balance(Currency::USD), cash_before);
+        assert_eq!(state.position(inst).unwrap().net_quantity(), pos_qty_before);
+    }
+
+    #[test]
+    fn buy_currency_mismatch_does_not_mutate_cash() {
+        let inst = instrument();
+        let d = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let txs = vec![
+            tx(d, TransactionKind::deposit(usd("1000.00")).unwrap()),
+            tx(
+                d,
+                TransactionKind::buy(inst, Decimal::from(10), usd("50.00"), usd("0.00"), None)
+                    .unwrap(),
+            ),
+        ];
+        let mut state = fold(&txs, &cfg()).unwrap();
+
+        let cash_before = state.cash_balance(Currency::USD);
+        let pos_qty_before = state.position(inst).unwrap().net_quantity();
+
+        let buy = tx(d, TransactionKind::buy(inst, Decimal::from(5), eur("80.00"), eur("0.00"), None).unwrap());
+        let result = apply(&mut state, &buy, &cfg());
+        assert!(matches!(result, Err(DomainError::CurrencyMismatch { .. })));
+
+        assert_eq!(state.cash_balance(Currency::USD), cash_before);
+        assert_eq!(state.cash_balance(Currency::EUR), Decimal::ZERO);
+        assert_eq!(state.position(inst).unwrap().net_quantity(), pos_qty_before);
+    }
+
+    #[test]
+    fn buy_specific_lot_not_found_does_not_mutate_cash() {
+        let inst = instrument();
+        let d = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let txs = vec![
+            tx(d, TransactionKind::deposit(usd("1000.00")).unwrap()),
+            tx(
+                d,
+                TransactionKind::sell(inst, Decimal::from(5), usd("50.00"), usd("0.00"), None)
+                    .unwrap(),
+            ),
+        ];
+        let mut state = fold(&txs, &cfg()).unwrap();
+
+        let cash_before = state.cash_balance(Currency::USD);
+        let pos_qty_before = state.position(inst).unwrap().net_quantity();
+
+        let specific = LotSelection::Specific(vec![LotSelectionEntry {
+            lot_id: LotId::new(),
+            quantity: Decimal::from(3),
+        }]);
+        let buy = tx(d, TransactionKind::buy(inst, Decimal::from(3), usd("55.00"), usd("0.00"), Some(specific)).unwrap());
+        let result = apply(&mut state, &buy, &cfg());
+        assert!(matches!(result, Err(DomainError::LotNotFound(_))));
+
+        assert_eq!(state.cash_balance(Currency::USD), cash_before);
+        assert_eq!(state.position(inst).unwrap().net_quantity(), pos_qty_before);
+    }
+
+    #[test]
+    fn buy_specific_quantity_mismatch_does_not_mutate_cash() {
+        let inst = instrument();
+        let d = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let txs = vec![
+            tx(d, TransactionKind::deposit(usd("1000.00")).unwrap()),
+            tx(
+                d,
+                TransactionKind::sell(inst, Decimal::from(5), usd("50.00"), usd("0.00"), None)
+                    .unwrap(),
+            ),
+        ];
+        let mut state = fold(&txs, &cfg()).unwrap();
+        let short_lot_id = state.position(inst).unwrap().lots()[0].id;
+
+        let cash_before = state.cash_balance(Currency::USD);
+        let pos_qty_before = state.position(inst).unwrap().net_quantity();
+
+        let specific = LotSelection::Specific(vec![LotSelectionEntry {
+            lot_id: short_lot_id,
+            quantity: Decimal::from(3),
+        }]);
+        let buy = tx(d, TransactionKind::buy(inst, Decimal::from(5), usd("55.00"), usd("0.00"), Some(specific)).unwrap());
+        let result = apply(&mut state, &buy, &cfg());
+        assert!(matches!(result, Err(DomainError::LotQuantityMismatch { .. })));
+
+        assert_eq!(state.cash_balance(Currency::USD), cash_before);
+        assert_eq!(state.position(inst).unwrap().net_quantity(), pos_qty_before);
     }
 }

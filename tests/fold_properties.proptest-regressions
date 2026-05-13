@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ee83c57ae344d8f137d7cd1b5c228ad00abe4d5b7110f2c624ab44570ff3fe42 # shrinks to buy_qty = 1, buy_price_cents = 100, split_ratio = 3, cfg = PortfolioConfig { lot_method: Fifo, base_currency: Currency([85, 83, 68]) }
+cc 3e5d8da554f13c549e8a13b2c163584dbd90a89e21cafd855a519018db8706b0 # shrinks to buy_qty = 51, buy_price_cents = 4243, split_ratio = 3, cfg = PortfolioConfig { lot_method: Fifo, base_currency: Currency([85, 83, 68]) }
