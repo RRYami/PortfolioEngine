@@ -135,7 +135,10 @@ mod tests {
         let p = Position::new(InstrumentId::new(), Currency::USD);
         assert!(p.is_empty());
         assert!(p.is_flat());
-        assert_eq!(p.long_cost_basis(), Money::new(Decimal::ZERO, Currency::USD));
+        assert_eq!(
+            p.long_cost_basis(),
+            Money::new(Decimal::ZERO, Currency::USD)
+        );
         assert_eq!(
             p.short_proceeds_basis(),
             Money::new(Decimal::ZERO, Currency::USD)
@@ -195,7 +198,10 @@ mod tests {
     #[test]
     fn long_cost_basis_single_lot() {
         let p = position_with(vec![make_lot(LotSide::Long, Decimal::from(10), "5.00")]);
-        assert_eq!(p.long_cost_basis(), Money::new(Decimal::from(50), Currency::USD));
+        assert_eq!(
+            p.long_cost_basis(),
+            Money::new(Decimal::from(50), Currency::USD)
+        );
     }
 
     #[test]
@@ -217,7 +223,10 @@ mod tests {
             make_lot(LotSide::Long, Decimal::from(10), "5.00"),
             make_lot(LotSide::Short, Decimal::from(3), "6.00"),
         ]);
-        assert_eq!(p.long_cost_basis(), Money::new(Decimal::from(50), Currency::USD));
+        assert_eq!(
+            p.long_cost_basis(),
+            Money::new(Decimal::from(50), Currency::USD)
+        );
     }
 
     #[test]

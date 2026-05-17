@@ -69,13 +69,13 @@ fn apply(
             let cost_per_unit = price.amount + (fees.amount / quantity);
 
             // --- Validation phase (no mutation) ---
-            if let Some(pos) = state.positions.get(instrument) {
-                if pos.currency() != price.currency {
-                    return Err(DomainError::CurrencyMismatch {
-                        expected: pos.currency(),
-                        got: price.currency,
-                    });
-                }
+            if let Some(pos) = state.positions.get(instrument)
+                && pos.currency() != price.currency
+            {
+                return Err(DomainError::CurrencyMismatch {
+                    expected: pos.currency(),
+                    got: price.currency,
+                });
             }
 
             if let Some(crate::lot_method::LotSelection::Specific(entries)) = lot_override {
@@ -130,8 +130,7 @@ fn apply(
                         .iter_mut()
                         .find(|l| l.id == entry.lot_id)
                         .expect("lot validated above");
-                    let lot_pnl =
-                        (lot.basis_per_unit.amount - cost_per_unit) * entry.quantity;
+                    let lot_pnl = (lot.basis_per_unit.amount - cost_per_unit) * entry.quantity;
                     realized_pnl += lot_pnl;
                     lot.quantity -= entry.quantity;
                 }
@@ -158,8 +157,7 @@ fn apply(
                     }
                     let close_qty = remaining_cover.min(lot.quantity);
                     // Short-cover PnL: (original_proceeds - cover_cost)
-                    let lot_pnl =
-                        (lot.basis_per_unit.amount - cost_per_unit) * close_qty;
+                    let lot_pnl = (lot.basis_per_unit.amount - cost_per_unit) * close_qty;
                     realized_pnl += lot_pnl;
                     lot.quantity -= close_qty;
                     remaining_cover -= close_qty;
@@ -206,13 +204,13 @@ fn apply(
             let sale_price_per_unit = price.amount - (fees.amount / quantity);
 
             // --- Validation phase (no mutation) ---
-            if let Some(pos) = state.positions.get(instrument) {
-                if pos.currency() != price.currency {
-                    return Err(DomainError::CurrencyMismatch {
-                        expected: pos.currency(),
-                        got: price.currency,
-                    });
-                }
+            if let Some(pos) = state.positions.get(instrument)
+                && pos.currency() != price.currency
+            {
+                return Err(DomainError::CurrencyMismatch {
+                    expected: pos.currency(),
+                    got: price.currency,
+                });
             }
 
             if let Some(crate::lot_method::LotSelection::Specific(entries)) = lot_override {
@@ -295,8 +293,7 @@ fn apply(
                     }
                     let qty = remaining_close.min(lot.quantity);
                     // Long-close PnL: (sale_price - cost_basis)
-                    let lot_pnl =
-                        (sale_price_per_unit - lot.basis_per_unit.amount) * qty;
+                    let lot_pnl = (sale_price_per_unit - lot.basis_per_unit.amount) * qty;
                     realized_pnl += lot_pnl;
                     lot.quantity -= qty;
                     remaining_close -= qty;
@@ -332,7 +329,9 @@ fn apply(
 
             Ok(())
         }
-        TransactionKind::Dividend { instrument, amount, .. } => {
+        TransactionKind::Dividend {
+            instrument, amount, ..
+        } => {
             let position = state
                 .positions
                 .get(instrument)
@@ -381,10 +380,18 @@ fn apply(
 fn sort_lots(lots: &mut Vec<&mut Lot>, method: LotMethod) {
     match method {
         LotMethod::Fifo => {
-            lots.sort_by(|a, b| a.open_date.cmp(&b.open_date).then(a.sequence.cmp(&b.sequence)));
+            lots.sort_by(|a, b| {
+                a.open_date
+                    .cmp(&b.open_date)
+                    .then(a.sequence.cmp(&b.sequence))
+            });
         }
         LotMethod::Lifo => {
-            lots.sort_by(|a, b| b.open_date.cmp(&a.open_date).then(b.sequence.cmp(&a.sequence)));
+            lots.sort_by(|a, b| {
+                b.open_date
+                    .cmp(&a.open_date)
+                    .then(b.sequence.cmp(&a.sequence))
+            });
         }
         _ => unimplemented!(),
     }
@@ -533,7 +540,10 @@ mod tests {
         assert_eq!(state.cash_balance(Currency::USD), Decimal::from(490));
         let pos = state.position(inst).unwrap();
         assert_eq!(pos.net_quantity(), Decimal::from(10));
-        assert_eq!(pos.long_cost_basis(), Money::new(Decimal::from(510), Currency::USD));
+        assert_eq!(
+            pos.long_cost_basis(),
+            Money::new(Decimal::from(510), Currency::USD)
+        );
     }
 
     #[test]
@@ -611,7 +621,10 @@ mod tests {
         let pos = state.position(inst).unwrap();
         assert_eq!(pos.net_quantity(), Decimal::from(10));
         // The $60 lot should remain (FIFO closed the $50 lot first).
-        assert_eq!(pos.long_cost_basis(), Money::new(Decimal::from(600), Currency::USD));
+        assert_eq!(
+            pos.long_cost_basis(),
+            Money::new(Decimal::from(600), Currency::USD)
+        );
     }
 
     #[test]
@@ -643,7 +656,10 @@ mod tests {
         let pos = state.position(inst).unwrap();
         assert_eq!(pos.net_quantity(), Decimal::from(10));
         // The $50 lot should remain (LIFO closed the $60 lot first).
-        assert_eq!(pos.long_cost_basis(), Money::new(Decimal::from(500), Currency::USD));
+        assert_eq!(
+            pos.long_cost_basis(),
+            Money::new(Decimal::from(500), Currency::USD)
+        );
     }
 
     #[test]
@@ -1074,7 +1090,11 @@ mod tests {
         let inst = instrument();
         let d = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
         let rev = TransactionKind::CorporateAction(
-            crate::transaction::CorporateAction::reverse_split(inst, Decimal::from_str_exact("0.1").unwrap()).unwrap(),
+            crate::transaction::CorporateAction::reverse_split(
+                inst,
+                Decimal::from_str_exact("0.1").unwrap(),
+            )
+            .unwrap(),
         );
         let txs = vec![
             tx(d, TransactionKind::deposit(usd("1000.00")).unwrap()),
@@ -1259,7 +1279,10 @@ mod tests {
 
         let pos = state.position(inst).unwrap();
         assert_eq!(pos.lots().len(), 1);
-        assert_eq!(pos.long_cost_basis(), Money::new(Decimal::from(505), Currency::USD));
+        assert_eq!(
+            pos.long_cost_basis(),
+            Money::new(Decimal::from(505), Currency::USD)
+        );
         assert_eq!(state.realized_pnl_in(Currency::USD), Decimal::ZERO);
     }
 
@@ -1312,16 +1335,20 @@ mod tests {
         let lot2_id = state.position(inst).unwrap().lots()[1].id;
 
         // Sell 5 shares specifically from lot2 ($60 lot), bypassing FIFO.
-        let specific = LotSelection::Specific(vec![
-            LotSelectionEntry {
-                lot_id: lot2_id,
-                quantity: Decimal::from(5),
-            },
-        ]);
+        let specific = LotSelection::Specific(vec![LotSelectionEntry {
+            lot_id: lot2_id,
+            quantity: Decimal::from(5),
+        }]);
         let sell = tx(
             d,
-            TransactionKind::sell(inst, Decimal::from(5), usd("70.00"), usd("0.00"), Some(specific))
-                .unwrap(),
+            TransactionKind::sell(
+                inst,
+                Decimal::from(5),
+                usd("70.00"),
+                usd("0.00"),
+                Some(specific),
+            )
+            .unwrap(),
         );
         apply(&mut state, &sell, &cfg()).unwrap();
 
@@ -1348,13 +1375,21 @@ mod tests {
         ];
         let mut state = fold(&txs, &cfg()).unwrap();
 
-        let specific = LotSelection::Specific(vec![
-            LotSelectionEntry {
-                lot_id: LotId::new(),
-                quantity: Decimal::from(5),
-            },
-        ]);
-        let sell = tx(d, TransactionKind::sell(inst, Decimal::from(5), usd("70.00"), usd("0.00"), Some(specific)).unwrap());
+        let specific = LotSelection::Specific(vec![LotSelectionEntry {
+            lot_id: LotId::new(),
+            quantity: Decimal::from(5),
+        }]);
+        let sell = tx(
+            d,
+            TransactionKind::sell(
+                inst,
+                Decimal::from(5),
+                usd("70.00"),
+                usd("0.00"),
+                Some(specific),
+            )
+            .unwrap(),
+        );
         let result = apply(&mut state, &sell, &cfg());
         assert!(matches!(result, Err(DomainError::LotNotFound(_))));
     }
@@ -1374,13 +1409,21 @@ mod tests {
         let mut state = fold(&txs, &cfg()).unwrap();
         let lot_id = state.position(inst).unwrap().lots()[0].id;
 
-        let specific = LotSelection::Specific(vec![
-            LotSelectionEntry {
-                lot_id,
-                quantity: Decimal::from(15),
-            },
-        ]);
-        let sell = tx(d, TransactionKind::sell(inst, Decimal::from(15), usd("70.00"), usd("0.00"), Some(specific)).unwrap());
+        let specific = LotSelection::Specific(vec![LotSelectionEntry {
+            lot_id,
+            quantity: Decimal::from(15),
+        }]);
+        let sell = tx(
+            d,
+            TransactionKind::sell(
+                inst,
+                Decimal::from(15),
+                usd("70.00"),
+                usd("0.00"),
+                Some(specific),
+            )
+            .unwrap(),
+        );
         let result = apply(&mut state, &sell, &cfg());
         assert!(matches!(
             result,
@@ -1407,13 +1450,21 @@ mod tests {
         let mut state = fold(&txs, &cfg()).unwrap();
         let lot_id = state.position(inst).unwrap().lots()[0].id;
 
-        let specific = LotSelection::Specific(vec![
-            LotSelectionEntry {
-                lot_id,
-                quantity: Decimal::from(3),
-            },
-        ]);
-        let sell = tx(d, TransactionKind::sell(inst, Decimal::from(5), usd("70.00"), usd("0.00"), Some(specific)).unwrap());
+        let specific = LotSelection::Specific(vec![LotSelectionEntry {
+            lot_id,
+            quantity: Decimal::from(3),
+        }]);
+        let sell = tx(
+            d,
+            TransactionKind::sell(
+                inst,
+                Decimal::from(5),
+                usd("70.00"),
+                usd("0.00"),
+                Some(specific),
+            )
+            .unwrap(),
+        );
         let result = apply(&mut state, &sell, &cfg());
         assert!(matches!(
             result,
@@ -1437,13 +1488,21 @@ mod tests {
         let mut state = fold(&txs, &cfg()).unwrap();
         let short_lot_id = state.position(inst).unwrap().lots()[0].id;
 
-        let specific = LotSelection::Specific(vec![
-            LotSelectionEntry {
-                lot_id: short_lot_id,
-                quantity: Decimal::from(3),
-            },
-        ]);
-        let sell = tx(d, TransactionKind::sell(inst, Decimal::from(3), usd("70.00"), usd("0.00"), Some(specific)).unwrap());
+        let specific = LotSelection::Specific(vec![LotSelectionEntry {
+            lot_id: short_lot_id,
+            quantity: Decimal::from(3),
+        }]);
+        let sell = tx(
+            d,
+            TransactionKind::sell(
+                inst,
+                Decimal::from(3),
+                usd("70.00"),
+                usd("0.00"),
+                Some(specific),
+            )
+            .unwrap(),
+        );
         let result = apply(&mut state, &sell, &cfg());
         assert!(matches!(result, Err(DomainError::LotNotFound(_))));
     }
@@ -1468,13 +1527,21 @@ mod tests {
         let mut state = fold(&txs, &cfg()).unwrap();
         let short_lot_id = state.position(inst).unwrap().lots()[0].id;
 
-        let specific = LotSelection::Specific(vec![
-            LotSelectionEntry {
-                lot_id: short_lot_id,
-                quantity: Decimal::from(5),
-            },
-        ]);
-        let buy = tx(d, TransactionKind::buy(inst, Decimal::from(5), usd("55.00"), usd("0.00"), Some(specific)).unwrap());
+        let specific = LotSelection::Specific(vec![LotSelectionEntry {
+            lot_id: short_lot_id,
+            quantity: Decimal::from(5),
+        }]);
+        let buy = tx(
+            d,
+            TransactionKind::buy(
+                inst,
+                Decimal::from(5),
+                usd("55.00"),
+                usd("0.00"),
+                Some(specific),
+            )
+            .unwrap(),
+        );
         apply(&mut state, &buy, &cfg()).unwrap();
 
         // Short covered exactly, position removed.
@@ -1505,7 +1572,17 @@ mod tests {
 
         // Override portfolio FIFO with LIFO for this single sell.
         let override_sel = LotSelection::Method(LotMethod::Lifo);
-        let sell = tx(d, TransactionKind::sell(inst, Decimal::from(5), usd("70.00"), usd("0.00"), Some(override_sel)).unwrap());
+        let sell = tx(
+            d,
+            TransactionKind::sell(
+                inst,
+                Decimal::from(5),
+                usd("70.00"),
+                usd("0.00"),
+                Some(override_sel),
+            )
+            .unwrap(),
+        );
         apply(&mut state, &sell, &cfg()).unwrap();
 
         // LIFO closes the $60 lot, leaving the $50 lot intact.
@@ -1538,7 +1615,10 @@ mod tests {
         let cash_before = state.cash_balance(Currency::USD);
         let pos_qty_before = state.position(inst).unwrap().net_quantity();
 
-        let sell = tx(d, TransactionKind::sell(inst, Decimal::from(5), eur("80.00"), eur("0.00"), None).unwrap());
+        let sell = tx(
+            d,
+            TransactionKind::sell(inst, Decimal::from(5), eur("80.00"), eur("0.00"), None).unwrap(),
+        );
         let result = apply(&mut state, &sell, &cfg());
         assert!(matches!(result, Err(DomainError::CurrencyMismatch { .. })));
 
@@ -1568,7 +1648,17 @@ mod tests {
             lot_id: LotId::new(),
             quantity: Decimal::from(5),
         }]);
-        let sell = tx(d, TransactionKind::sell(inst, Decimal::from(5), usd("70.00"), usd("0.00"), Some(specific)).unwrap());
+        let sell = tx(
+            d,
+            TransactionKind::sell(
+                inst,
+                Decimal::from(5),
+                usd("70.00"),
+                usd("0.00"),
+                Some(specific),
+            )
+            .unwrap(),
+        );
         let result = apply(&mut state, &sell, &cfg());
         assert!(matches!(result, Err(DomainError::LotNotFound(_))));
 
@@ -1598,9 +1688,22 @@ mod tests {
             lot_id,
             quantity: Decimal::from(3),
         }]);
-        let sell = tx(d, TransactionKind::sell(inst, Decimal::from(5), usd("70.00"), usd("0.00"), Some(specific)).unwrap());
+        let sell = tx(
+            d,
+            TransactionKind::sell(
+                inst,
+                Decimal::from(5),
+                usd("70.00"),
+                usd("0.00"),
+                Some(specific),
+            )
+            .unwrap(),
+        );
         let result = apply(&mut state, &sell, &cfg());
-        assert!(matches!(result, Err(DomainError::LotQuantityMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(DomainError::LotQuantityMismatch { .. })
+        ));
 
         assert_eq!(state.cash_balance(Currency::USD), cash_before);
         assert_eq!(state.position(inst).unwrap().net_quantity(), pos_qty_before);
@@ -1623,7 +1726,10 @@ mod tests {
         let cash_before = state.cash_balance(Currency::USD);
         let pos_qty_before = state.position(inst).unwrap().net_quantity();
 
-        let buy = tx(d, TransactionKind::buy(inst, Decimal::from(5), eur("80.00"), eur("0.00"), None).unwrap());
+        let buy = tx(
+            d,
+            TransactionKind::buy(inst, Decimal::from(5), eur("80.00"), eur("0.00"), None).unwrap(),
+        );
         let result = apply(&mut state, &buy, &cfg());
         assert!(matches!(result, Err(DomainError::CurrencyMismatch { .. })));
 
@@ -1653,7 +1759,17 @@ mod tests {
             lot_id: LotId::new(),
             quantity: Decimal::from(3),
         }]);
-        let buy = tx(d, TransactionKind::buy(inst, Decimal::from(3), usd("55.00"), usd("0.00"), Some(specific)).unwrap());
+        let buy = tx(
+            d,
+            TransactionKind::buy(
+                inst,
+                Decimal::from(3),
+                usd("55.00"),
+                usd("0.00"),
+                Some(specific),
+            )
+            .unwrap(),
+        );
         let result = apply(&mut state, &buy, &cfg());
         assert!(matches!(result, Err(DomainError::LotNotFound(_))));
 
@@ -1683,9 +1799,22 @@ mod tests {
             lot_id: short_lot_id,
             quantity: Decimal::from(3),
         }]);
-        let buy = tx(d, TransactionKind::buy(inst, Decimal::from(5), usd("55.00"), usd("0.00"), Some(specific)).unwrap());
+        let buy = tx(
+            d,
+            TransactionKind::buy(
+                inst,
+                Decimal::from(5),
+                usd("55.00"),
+                usd("0.00"),
+                Some(specific),
+            )
+            .unwrap(),
+        );
         let result = apply(&mut state, &buy, &cfg());
-        assert!(matches!(result, Err(DomainError::LotQuantityMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(DomainError::LotQuantityMismatch { .. })
+        ));
 
         assert_eq!(state.cash_balance(Currency::USD), cash_before);
         assert_eq!(state.position(inst).unwrap().net_quantity(), pos_qty_before);

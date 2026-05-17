@@ -2,7 +2,7 @@
 
 ## Project
 Portfolio analytics engine — domain layer in Rust.
-Current focus: transaction-to-position fold with lot accounting, multi-currency cash, and property-based tests.
+Current focus: FX rate provider, price provider, and base-currency portfolio valuation.
 
 ## Tech Stack
 - **Language**: Rust stable, edition 2024
@@ -25,6 +25,7 @@ cargo test
 
 # Run only property tests
 cargo test --test fold_properties
+cargo test --test valuation_properties
 
 # Check formatting and lints
 cargo fmt --check
@@ -82,14 +83,14 @@ cargo clippy -- -D warnings
 - Borrow fees and margin interest accounting
 - Options, futures, derivatives
 - Snapshot caching for performance
-- FX rate provider and base-currency valuation
-- Price provider and mark-to-market
 
 ## File Layout
 ```
 src/
   currency.rs          # Currency newtype, strict validation
   error.rs             # DomainError enum
+  fold.rs              # fold() and apply() — core lot-closing logic
+  fx.rs                # FxRateProvider trait, FxError, StaticFxRateProvider, TriangulatingFxProvider
   ids.rs               # Uuid newtypes (InstrumentId, LotId, etc.)
   instrument.rs        # Instrument, InstrumentKind
   lot.rs               # Lot struct with sequence, side, basis
@@ -98,11 +99,13 @@ src/
   portfolio_config.rs  # PortfolioConfig { lot_method, base_currency }
   portfolio_state.rs   # PortfolioState { positions, cash, realized_pnl, next_lot_sequence }
   position.rs          # Position { instrument, currency, lots, realized_pnl }
+  price.rs             # PriceProvider trait, PriceError, StaticPriceProvider
   transaction.rs       # Transaction, TransactionKind, CorporateAction + constructors
-  fold.rs              # fold() and apply() — core lot-closing logic
+  valuation.rs         # ValuationError, PortfolioState::total_value()
 
 tests/
-  fold_properties.rs   # proptest invariants
+  fold_properties.rs       # proptest invariants for fold
+  valuation_properties.rs  # proptest invariants for FX and valuation
 ```
 
 ## How to Extend
@@ -110,4 +113,8 @@ tests/
 2. Add new `TransactionKind` or `CorporateAction` variants with constructor validation.
 3. Add a new arm in `apply()` in `fold.rs`.
 4. Add unit tests in `fold.rs` and property tests in `tests/fold_properties.rs`.
-5. Update this file if conventions or deferred items change.
+5. For new provider traits (e.g. `CorporateActionProvider`), follow the pattern in `fx.rs` and `price.rs`:
+   - Define the trait with a sync method returning `Result<_, TypedError>`.
+   - Provide a `Static*` in-memory impl for tests.
+   - Add property tests in `tests/valuation_properties.rs` or a new file.
+6. Update this file if conventions or deferred items change.

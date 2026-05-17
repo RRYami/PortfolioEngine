@@ -59,7 +59,10 @@ impl PortfolioState {
     }
 
     pub fn realized_pnl_in(&self, currency: Currency) -> Decimal {
-        self.realized_pnl.get(&currency).copied().unwrap_or(Decimal::ZERO)
+        self.realized_pnl
+            .get(&currency)
+            .copied()
+            .unwrap_or(Decimal::ZERO)
     }
 
     pub fn currencies(&self) -> impl Iterator<Item = Currency> + '_ {
