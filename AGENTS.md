@@ -2,7 +2,7 @@
 
 ## Project
 Portfolio analytics engine — domain layer in Rust.
-Current focus: FX rate provider, price provider, and base-currency portfolio valuation.
+Current focus: v1 fold and valuation complete. Next: persistence or API layer.
 
 ## Tech Stack
 - **Language**: Rust stable, edition 2024
@@ -58,14 +58,23 @@ cargo clippy -- -D warnings
 - Balances are **never summed across currencies** in the domain layer.
 - Cash balances may go negative; overdraft detection is a caller concern.
 
+### FX and valuation
+- `FxRateProvider` is a synchronous trait with a default `rate()` method that returns `Decimal::ONE` for same-currency identity and delegates to `rate_impl()` for cross-currency lookups.
+- `TriangulatingFxProvider<P>` wraps any `FxRateProvider` and attempts direct rate → inverse rate → triangulation via a pivot currency (4 leg-direction combinations). Inversion is subject to `Decimal` truncation; round-trip tests use an epsilon.
+- `PriceProvider` returns `Money` so the currency travels with the price. `total_value()` checks that each price's currency matches the position's currency and returns `ValuationError::PriceCurrencyMismatch` on mismatch — no silent substitution.
+- `PortfolioState::total_value()` is synchronous. Async fetching happens at the adapter layer; the domain stays a pure function.
+
 ### Errors
 - `DomainError` is a typed enum with validation and fold variants.
+- `FxError` has `RateUnavailable`, `ProviderError`, and `DivisionByZero` (for zero-rate inversion).
+- `PriceError` has `PriceUnavailable` and `ProviderError`.
+- `ValuationError` wraps `FxError` and `PriceError`, plus `PriceCurrencyMismatch`.
 - Constructors on `TransactionKind` and `CorporateAction` validate invariants and return `Result<_, DomainError>`.
 
 ## Testing Conventions
 - **Unit tests**: inline `#[cfg(test)]` modules per file for type-internal invariants.
 - **Integration tests**: `tests/` directory for end-to-end and property-based tests.
-- **Property tests**: `tests/fold_properties.rs` using `proptest`. Default 256 cases per property.
+- **Property tests**: `tests/fold_properties.rs` (11 properties) and `tests/valuation_properties.rs` (5 properties) using `proptest`. Default 256 cases per property.
 - When a property fails, trust proptest's shrinking — the minimized counterexample usually points straight at the bug.
 
 ## Key Design Decisions
@@ -74,6 +83,10 @@ cargo clippy -- -D warnings
 3. Dividends on short positions error with `DomainError::DividendOnShortPosition` in v1. Correct short-dividend semantics deferred.
 4. Fees are baked into `basis_per_unit` at lot creation (pro-rata). Cash deduction uses gross + fees separately.
 5. Chronological ordering of transactions is enforced by `fold`: strictly non-decreasing `trade_date`, error on violation.
+6. FX/valuation traits are **synchronous** in the domain. Async fetching is an adapter concern: batch-fetch rates into a `StaticFxRateProvider`, then pass it to `total_value()`.
+7. Same-currency FX requests return `Decimal::ONE` via the trait's default `rate()` method; implementors never handle this case.
+8. `TriangulatingFxProvider` attempts rate resolution in order: direct → inverse → triangulation (4 leg combos). Inversion round-trips are approximate due to `Decimal` truncation.
+9. `total_value()` returns `ValuationError::PriceCurrencyMismatch` when a price's currency doesn't match the position's currency. No silent substitution of zero or wrong-currency prices.
 
 ## Deferred (do not implement unprompted)
 - Persistence (Postgres schema, migrations)
@@ -104,9 +117,15 @@ src/
   valuation.rs         # ValuationError, PortfolioState::total_value()
 
 tests/
-  fold_properties.rs       # proptest invariants for fold
-  valuation_properties.rs  # proptest invariants for FX and valuation
+  fold_properties.rs       # proptest invariants for fold (11 properties)
+  valuation_properties.rs # proptest invariants for FX and valuation (5 properties)
 ```
+
+## Test Counts
+- **141 unit tests** (inline `#[cfg(test)]` across all source files)
+- **11 fold property tests** (`tests/fold_properties.rs`)
+- **5 valuation property tests** (`tests/valuation_properties.rs`)
+- **Total: 157 tests, all passing**
 
 ## How to Extend
 1. Add new error variants to `DomainError` if needed.
