@@ -10,6 +10,7 @@ name = "ptf_engine"
 [features]
 default = []
 serde = ["dep:serde", "rust_decimal/serde-with-str", "chrono/serde", "uuid/serde"]
+in-memory-repo = ["dep:tokio"]
 
 [dependencies]
 rust_decimal = { workspace = true }
@@ -17,10 +18,13 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, optional = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
 
 [lints]
 workspace = true

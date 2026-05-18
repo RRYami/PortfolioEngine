@@ -1,3 +1,5 @@
+use std::fmt;
+
 use uuid::Uuid;
 
 /// Newtype wrapper around [`Uuid`] for type-safe instrument identity.
@@ -65,6 +67,30 @@ impl Default for LotId {
 impl Default for TransactionId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl fmt::Display for InstrumentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for PortfolioId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for LotId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for TransactionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
