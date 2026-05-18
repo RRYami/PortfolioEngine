@@ -28,10 +28,12 @@ Implemented:
 - `PriceProvider` trait, `PriceError`, `StaticPriceProvider`
 - `ValuationError` (wraps `FxError`, `PriceError`, `PriceCurrencyMismatch`)
 - `PortfolioState::total_value()` — multi-currency valuation with FX conversion
-- 141 unit tests + 16 property tests, all passing
+- **serde feature**: optional `Serialize`/`Deserialize` on all domain types for JSON persistence and API responses
+- **Repository traits**: async `PortfolioRepository`, `TransactionRepository`, `InstrumentRepository` with thread-safe in-memory implementations
+- 157 unit tests + 16 property tests + 35 serde round-trip tests, all passing
 
 Deferred:
-- Persistence (Postgres)
+- Postgres persistence
 - HTTP/API layer
 - Snapshot caching for performance
 - Borrow fees, margin interest, derivatives
@@ -40,49 +42,81 @@ Deferred:
 
 ```bash
 # Build
-cd backend && cargo build
+cargo build --workspace
 
-# Run all tests
-cd backend && cargo test
+# Run all tests (domain only, no serde, no in-memory repo)
+cargo test --workspace
+
+# Run all tests with serde and in-memory repo enabled
+cargo test --workspace --all-features
 
 # Run only property tests
-cd backend && cargo test --test fold_properties
-cd backend && cargo test --test valuation_properties
+cargo test --workspace --test fold_properties
+cargo test --workspace --test valuation_properties
 
 # Check formatting and lints
-cd backend && cargo fmt --check
-cd backend && cargo clippy -- -D warnings
+cargo fmt --check
+cargo clippy --workspace --all-features -- -D warnings
+
+# Dev services (Postgres)
+make db-up
+make db-reset
+make psql
 ```
 
-## Repository layout
+## Workspace layout
 
 ```
-backend/       Rust crate (ptf_engine)
-  src/
-    fold.rs              # fold(&[Transaction], &PortfolioConfig) -> Result<PortfolioState, DomainError>
-    fx.rs                # FxRateProvider trait, FxError, StaticFxRateProvider, TriangulatingFxProvider
-    price.rs             # PriceProvider trait, PriceError, StaticPriceProvider
-    valuation.rs         # ValuationError, PortfolioState::total_value()
-    transaction.rs       # Transaction, TransactionKind, CorporateAction (with constructor validation)
-    lot.rs               # Lot with side, quantity, basis_per_unit, sequence (deterministic ordering)
-    position.rs          # Position: instrument, currency, lots, realized_pnl
-    portfolio_state.rs   # PortfolioState: positions, cash, realized_pnl, next_lot_sequence
-    portfolio_config.rs  # PortfolioConfig: lot_method, base_currency
-    money.rs             # Money { amount: Decimal, currency: Currency }
-    currency.rs          # Currency newtype (3-letter ASCII uppercase)
-    error.rs             # DomainError enum
-    ids.rs               # Uuid newtypes (InstrumentId, LotId, etc.)
-    instrument.rs        # Instrument, InstrumentKind
-    lot_method.rs        # LotMethod, LotSide, LotSelection, LotSelectionEntry
-  tests/
-    fold_properties.rs       # proptest invariants for fold (11 properties)
-    valuation_properties.rs  # proptest invariants for FX and valuation (5 properties)
-
-frontend/      Next.js app (to be scaffolded)
-shared/        API schema contract (ts-rs output or OpenAPI spec)
+ptf_engine/
+  Cargo.toml              # workspace root
+  Cargo.lock              # workspace lockfile
+  docker-compose.yml      # postgres:16-alpine on port 5433
+  Makefile                # db-up, db-down, db-reset, test, etc.
+  .env                    # DATABASE_URL for local dev
+  crates/
+    engine/               # domain crate (ptf-engine)
+      src/
+        lib.rs             # public re-exports
+        fold.rs            # fold() and apply() — core lot-closing logic
+        fx.rs              # FxRateProvider, FxError, StaticFxRateProvider, TriangulatingFxProvider
+        price.rs           # PriceProvider, PriceError, StaticPriceProvider
+        valuation.rs       # ValuationError, PortfolioState::total_value()
+        transaction.rs     # Transaction, TransactionKind, CorporateAction + constructors
+        lot.rs             # Lot struct with sequence, side, basis
+        position.rs        # Position: instrument, currency, lots
+        portfolio_state.rs # PortfolioState: positions, cash, realized_pnl
+        portfolio.rs       # Portfolio: metadata (id, name, base_currency, lot_method)
+        portfolio_config.rs# PortfolioConfig { lot_method, base_currency }
+        money.rs           # Money { amount: Decimal, currency: Currency }
+        currency.rs        # Currency newtype (3-letter ASCII uppercase)
+        error.rs           # DomainError enum
+        ids.rs             # Uuid newtypes (InstrumentId, LotId, etc.)
+        instrument.rs      # Instrument, InstrumentKind
+        lot_method.rs      # LotMethod, LotSide, LotSelection, LotSelectionEntry
+        repository/        # storage contracts and in-memory impls
+          mod.rs           # re-exports
+          error.rs         # RepoError
+          portfolio.rs     # PortfolioRepository trait
+          transaction.rs   # TransactionRepository trait
+          instrument.rs    # InstrumentRepository trait
+          memory.rs        # InMemory*Repository impls
+      tests/
+        fold_properties.rs       # proptest invariants for fold (11 properties)
+        valuation_properties.rs    # proptest invariants for FX and valuation (5 properties)
+        serde_roundtrip.rs       # serde round-trip tests (35 tests, serde feature)
+    persistence/          # Postgres implementations (coming in slice 4+)
+  frontend/             # Next.js app (to be scaffolded)
+  shared/               # API schema contract (OpenAPI spec)
 ```
 
-The domain layer (`backend/src/`) has **zero I/O dependencies** — no `sqlx`, no HTTP, no file I/O. I/O boundaries are defined as traits (`PriceProvider`, `FxRateProvider`, `PortfolioRepository`) with concrete implementations living outside the domain.
+The domain layer (`crates/engine/src/`) has **zero I/O dependencies** — no `sqlx`, no HTTP, no file I/O. I/O boundaries are defined as traits (`PriceProvider`, `FxRateProvider`, `PortfolioRepository`, etc.) with concrete implementations living outside the domain.
+
+## Cargo features
+
+| Feature | Description |
+|---------|-------------|
+| `serde` | Enables `Serialize`/`Deserialize` on all domain types. Required for JSONB persistence and API serialization. |
+| `in-memory-repo` | Exposes `InMemoryPortfolioRepository`, `InMemoryTransactionRepository`, `InMemoryInstrumentRepository`. Useful for testing and standalone analytics. |
 
 ## Design highlights
 
