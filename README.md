@@ -40,46 +40,49 @@ Deferred:
 
 ```bash
 # Build
-cargo build
+cd backend && cargo build
 
 # Run all tests
-cargo test
+cd backend && cargo test
 
 # Run only property tests
-cargo test --test fold_properties
-cargo test --test valuation_properties
+cd backend && cargo test --test fold_properties
+cd backend && cargo test --test valuation_properties
 
 # Check formatting and lints
-cargo fmt --check
-cargo clippy -- -D warnings
+cd backend && cargo fmt --check
+cd backend && cargo clippy -- -D warnings
 ```
 
-## Architecture
+## Repository layout
 
 ```
-src/
-  fold.rs              # fold(&[Transaction], &PortfolioConfig) -> Result<PortfolioState, DomainError>
-  fx.rs                # FxRateProvider trait, FxError, StaticFxRateProvider, TriangulatingFxProvider
-  price.rs             # PriceProvider trait, PriceError, StaticPriceProvider
-  valuation.rs         # ValuationError, PortfolioState::total_value()
-  transaction.rs       # Transaction, TransactionKind, CorporateAction (with constructor validation)
-  lot.rs               # Lot with side, quantity, basis_per_unit, sequence (deterministic ordering)
-  position.rs          # Position: instrument, currency, lots, realized_pnl
-  portfolio_state.rs   # PortfolioState: positions, cash, realized_pnl, next_lot_sequence
-  portfolio_config.rs  # PortfolioConfig: lot_method, base_currency
-  money.rs             # Money { amount: Decimal, currency: Currency }
-  currency.rs          # Currency newtype (3-letter ASCII uppercase)
-  error.rs             # DomainError enum
-  ids.rs               # Uuid newtypes (InstrumentId, LotId, etc.)
-  instrument.rs        # Instrument, InstrumentKind
-  lot_method.rs        # LotMethod, LotSide, LotSelection, LotSelectionEntry
+backend/       Rust crate (ptf_engine)
+  src/
+    fold.rs              # fold(&[Transaction], &PortfolioConfig) -> Result<PortfolioState, DomainError>
+    fx.rs                # FxRateProvider trait, FxError, StaticFxRateProvider, TriangulatingFxProvider
+    price.rs             # PriceProvider trait, PriceError, StaticPriceProvider
+    valuation.rs         # ValuationError, PortfolioState::total_value()
+    transaction.rs       # Transaction, TransactionKind, CorporateAction (with constructor validation)
+    lot.rs               # Lot with side, quantity, basis_per_unit, sequence (deterministic ordering)
+    position.rs          # Position: instrument, currency, lots, realized_pnl
+    portfolio_state.rs   # PortfolioState: positions, cash, realized_pnl, next_lot_sequence
+    portfolio_config.rs  # PortfolioConfig: lot_method, base_currency
+    money.rs             # Money { amount: Decimal, currency: Currency }
+    currency.rs          # Currency newtype (3-letter ASCII uppercase)
+    error.rs             # DomainError enum
+    ids.rs               # Uuid newtypes (InstrumentId, LotId, etc.)
+    instrument.rs        # Instrument, InstrumentKind
+    lot_method.rs        # LotMethod, LotSide, LotSelection, LotSelectionEntry
+  tests/
+    fold_properties.rs       # proptest invariants for fold (11 properties)
+    valuation_properties.rs  # proptest invariants for FX and valuation (5 properties)
 
-tests/
-  fold_properties.rs       # proptest invariants for fold (11 properties)
-  valuation_properties.rs # proptest invariants for FX and valuation (5 properties)
+frontend/      Next.js app (to be scaffolded)
+shared/        API schema contract (ts-rs output or OpenAPI spec)
 ```
 
-The domain layer (`src/`) has **zero I/O dependencies** — no `sqlx`, no HTTP, no file I/O. I/O boundaries are defined as traits (`PriceProvider`, `FxRateProvider`, `PortfolioRepository`) with concrete implementations living outside the domain.
+The domain layer (`backend/src/`) has **zero I/O dependencies** — no `sqlx`, no HTTP, no file I/O. I/O boundaries are defined as traits (`PriceProvider`, `FxRateProvider`, `PortfolioRepository`) with concrete implementations living outside the domain.
 
 ## Design highlights
 

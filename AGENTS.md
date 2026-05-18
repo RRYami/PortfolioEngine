@@ -18,24 +18,24 @@ Current focus: v1 fold and valuation complete. Next: persistence or API layer.
 ## Build & Test
 ```bash
 # Compile
-cargo build
+cd backend && cargo build
 
 # Run all tests (unit + integration + property)
-cargo test
+cd backend && cargo test
 
 # Run only property tests
-cargo test --test fold_properties
-cargo test --test valuation_properties
+cd backend && cargo test --test fold_properties
+cd backend && cargo test --test valuation_properties
 
 # Check formatting and lints
-cargo fmt --check
-cargo clippy -- -D warnings
+cd backend && cargo fmt --check
+cd backend && cargo clippy -- -D warnings
 ```
 
 ## Architecture Conventions
 
 ### Layered architecture (domain → repositories → services → API)
-- **Domain layer** (`src/`) must remain dependency-free: no `sqlx`, no HTTP, no file I/O.
+- **Domain layer** (`backend/src/`) must remain dependency-free: no `sqlx`, no HTTP, no file I/O.
 - I/O boundaries are traits: `PriceProvider`, `FxRateProvider`, `PortfolioRepository`, etc.
 - Concrete impls live outside the domain.
 
@@ -99,26 +99,29 @@ cargo clippy -- -D warnings
 
 ## File Layout
 ```
-src/
-  currency.rs          # Currency newtype, strict validation
-  error.rs             # DomainError enum
-  fold.rs              # fold() and apply() — core lot-closing logic
-  fx.rs                # FxRateProvider trait, FxError, StaticFxRateProvider, TriangulatingFxProvider
-  ids.rs               # Uuid newtypes (InstrumentId, LotId, etc.)
-  instrument.rs        # Instrument, InstrumentKind
-  lot.rs               # Lot struct with sequence, side, basis
-  lot_method.rs        # LotMethod, LotSide, LotSelection, LotSelectionEntry
-  money.rs             # Money { amount, currency }
-  portfolio_config.rs  # PortfolioConfig { lot_method, base_currency }
-  portfolio_state.rs   # PortfolioState { positions, cash, realized_pnl, next_lot_sequence }
-  position.rs          # Position { instrument, currency, lots, realized_pnl }
-  price.rs             # PriceProvider trait, PriceError, StaticPriceProvider
-  transaction.rs       # Transaction, TransactionKind, CorporateAction + constructors
-  valuation.rs         # ValuationError, PortfolioState::total_value()
+backend/
+  src/
+    currency.rs          # Currency newtype, strict validation
+    error.rs             # DomainError enum
+    fold.rs              # fold() and apply() — core lot-closing logic
+    fx.rs                # FxRateProvider trait, FxError, StaticFxRateProvider, TriangulatingFxProvider
+    ids.rs               # Uuid newtypes (InstrumentId, LotId, etc.)
+    instrument.rs        # Instrument, InstrumentKind
+    lot.rs               # Lot struct with sequence, side, basis
+    lot_method.rs        # LotMethod, LotSide, LotSelection, LotSelectionEntry
+    money.rs             # Money { amount, currency }
+    portfolio_config.rs  # PortfolioConfig { lot_method, base_currency }
+    portfolio_state.rs   # PortfolioState { positions, cash, realized_pnl, next_lot_sequence }
+    position.rs          # Position { instrument, currency, lots, realized_pnl }
+    price.rs             # PriceProvider trait, PriceError, StaticPriceProvider
+    transaction.rs       # Transaction, TransactionKind, CorporateAction + constructors
+    valuation.rs         # ValuationError, PortfolioState::total_value()
+  tests/
+    fold_properties.rs       # proptest invariants for fold (11 properties)
+    valuation_properties.rs  # proptest invariants for FX and valuation (5 properties)
 
-tests/
-  fold_properties.rs       # proptest invariants for fold (11 properties)
-  valuation_properties.rs # proptest invariants for FX and valuation (5 properties)
+frontend/      # Next.js app (to be scaffolded)
+shared/        # API schema contract (ts-rs output or OpenAPI spec)
 ```
 
 ## Test Counts
