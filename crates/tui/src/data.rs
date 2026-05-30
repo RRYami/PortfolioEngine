@@ -1,8 +1,9 @@
 use chrono::NaiveDate;
 use ptf_engine::{
-    fold, CorporateAction, Currency, Instrument, InstrumentId, InstrumentKind, LotMethod, Money,
+    CorporateAction, Currency, Instrument, InstrumentId, InstrumentKind, LotMethod, Money,
     Portfolio, PortfolioConfig, PortfolioId, PortfolioState, StaticFxRateProvider,
-    StaticPriceProvider, Transaction, TransactionId, TransactionKind,
+    StaticHistoricalPriceProvider, StaticPriceProvider, Transaction, TransactionId,
+    TransactionKind, fold,
 };
 use rust_decimal::Decimal;
 
@@ -15,6 +16,7 @@ pub struct SeedData {
     pub state: PortfolioState,
     pub prices: StaticPriceProvider,
     pub fx: StaticFxRateProvider,
+    pub historical_prices: StaticHistoricalPriceProvider,
     pub as_of: NaiveDate,
 }
 
@@ -36,6 +38,33 @@ fn eur(amount: &str) -> Money {
 
 fn jpy(amount: &str) -> Money {
     Money::new(Decimal::from_str_exact(amount).unwrap(), Currency::JPY)
+}
+
+/// Deterministic pseudo-random walk for mock historical prices.
+/// Returns `count` daily prices starting from `start_date`.
+fn price_series(start_date: NaiveDate, count: usize, initial: Money) -> Vec<(NaiveDate, Money)> {
+    let mut prices = Vec::with_capacity(count);
+    let mut current = initial.amount;
+    let currency = initial.currency;
+    for i in 0..count {
+        let day_offset = i64::try_from(i).expect("count fits in i64");
+        let date = start_date + chrono::Duration::days(day_offset);
+        prices.push((date, Money::new(current, currency)));
+        // deterministic daily return between -2 % and +2 %
+        let change = Decimal::new((day_offset * 12_345 + 67_890) % 401 - 200, 4);
+        current = (current * (Decimal::ONE + change)).round_dp(2);
+    }
+    prices
+}
+
+fn fill_historical(
+    provider: &mut StaticHistoricalPriceProvider,
+    instrument: InstrumentId,
+    series: &[(NaiveDate, Money)],
+) {
+    for (date, price) in series {
+        provider.insert(instrument, *date, *price);
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -88,13 +117,25 @@ pub fn seed_data() -> SeedData {
 
     let transactions = vec![
         // 1. Fund the account
-        tx(d(2024, 1, 2), TransactionKind::deposit(usd("100000")).unwrap()),
-        tx(d(2024, 1, 2), TransactionKind::deposit(eur("50000")).unwrap()),
+        tx(
+            d(2024, 1, 2),
+            TransactionKind::deposit(usd("100000")).unwrap(),
+        ),
+        tx(
+            d(2024, 1, 2),
+            TransactionKind::deposit(eur("50000")).unwrap(),
+        ),
         // 2. Build long positions
         tx(
             d(2024, 1, 3),
-            TransactionKind::buy(aapl_id, Decimal::from(100), usd("185.00"), usd("9.99"), None)
-                .unwrap(),
+            TransactionKind::buy(
+                aapl_id,
+                Decimal::from(100),
+                usd("185.00"),
+                usd("9.99"),
+                None,
+            )
+            .unwrap(),
         ),
         tx(
             d(2024, 1, 5),
@@ -109,8 +150,14 @@ pub fn seed_data() -> SeedData {
         // 3. SHORT FLIP — sell more AAPL than we own
         tx(
             d(2024, 1, 10),
-            TransactionKind::sell(aapl_id, Decimal::from(130), usd("190.00"), usd("9.99"), None)
-                .unwrap(),
+            TransactionKind::sell(
+                aapl_id,
+                Decimal::from(130),
+                usd("190.00"),
+                usd("9.99"),
+                None,
+            )
+            .unwrap(),
         ),
         // 4. Cover the short + reopen long
         tx(
@@ -193,8 +240,7 @@ pub fn seed_data() -> SeedData {
         as_of,
         Decimal::from_str_exact("0.00625").unwrap(),
     );
-    // Direct USD ↔ JPY rates (triangulation via EUR also works, but explicit
-    // rates make the demo faster and the FX popup cleaner).
+    // Direct USD ↔ JPY rates
     fx.insert(
         Currency::USD,
         Currency::JPY,
@@ -208,6 +254,30 @@ pub fn seed_data() -> SeedData {
         Decimal::from_str_exact("0.006781").unwrap(),
     );
 
+    // Mock historical prices (253 days ending at as_of)
+    let hist_start = as_of - chrono::Duration::days(252);
+    let mut historical_prices = StaticHistoricalPriceProvider::new();
+    fill_historical(
+        &mut historical_prices,
+        aapl_id,
+        &price_series(hist_start, 253, usd("180.00")),
+    );
+    fill_historical(
+        &mut historical_prices,
+        nvda_id,
+        &price_series(hist_start, 253, usd("490.00")),
+    );
+    fill_historical(
+        &mut historical_prices,
+        sap_id,
+        &price_series(hist_start, 253, eur("125.00")),
+    );
+    fill_historical(
+        &mut historical_prices,
+        sony_id,
+        &price_series(hist_start, 253, jpy("12000")),
+    );
+
     SeedData {
         portfolio,
         config,
@@ -216,6 +286,7 @@ pub fn seed_data() -> SeedData {
         state,
         prices,
         fx,
+        historical_prices,
         as_of,
     }
 }
@@ -252,7 +323,10 @@ pub fn seed_data_us_growth() -> SeedData {
     ];
 
     let transactions = vec![
-        tx(d(2024, 1, 15), TransactionKind::deposit(usd("50000")).unwrap()),
+        tx(
+            d(2024, 1, 15),
+            TransactionKind::deposit(usd("50000")).unwrap(),
+        ),
         tx(
             d(2024, 1, 16),
             TransactionKind::buy(tsla_id, Decimal::from(20), usd("250.00"), usd("5.00"), None)
@@ -279,6 +353,19 @@ pub fn seed_data_us_growth() -> SeedData {
 
     let fx = StaticFxRateProvider::new();
 
+    let hist_start = as_of - chrono::Duration::days(252);
+    let mut historical_prices = StaticHistoricalPriceProvider::new();
+    fill_historical(
+        &mut historical_prices,
+        tsla_id,
+        &price_series(hist_start, 253, usd("250.00")),
+    );
+    fill_historical(
+        &mut historical_prices,
+        meta_id,
+        &price_series(hist_start, 253, usd("300.00")),
+    );
+
     SeedData {
         portfolio,
         config,
@@ -287,6 +374,7 @@ pub fn seed_data_us_growth() -> SeedData {
         state,
         prices,
         fx,
+        historical_prices,
         as_of,
     }
 }

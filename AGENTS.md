@@ -157,6 +157,7 @@ ptf_engine/
         error.rs           # DomainError enum
         fold.rs            # fold() and apply() — core lot-closing logic
         fx.rs              # FxRateProvider trait, FxError, StaticFxRateProvider, TriangulatingFxProvider
+        historical_price.rs # HistoricalPriceProvider trait, StaticHistoricalPriceProvider
         ids.rs             # Uuid newtypes (InstrumentId, LotId, etc.)
         instrument.rs      # Instrument, InstrumentKind
         lot.rs             # Lot struct with sequence, side, basis
@@ -168,6 +169,7 @@ ptf_engine/
         position.rs        # Position { instrument, currency, lots, realized_pnl }
         price.rs           # PriceProvider trait, PriceError, StaticPriceProvider
         repository/        # storage contracts and in-memory impls
+        risk.rs            # MonteCarloConfig, VaRReport, AssetRisk, compute_var()
           mod.rs
           error.rs         # RepoError
           portfolio.rs     # PortfolioRepository trait
@@ -184,19 +186,19 @@ ptf_engine/
     tui/                 # TUI demo binary (ptf-tui)
       Cargo.toml
       src/
-        main.rs            # crossterm event loop, screen state machine, popups
-        data.rs            # pre-seeded portfolios, instruments, transactions, prices, FX rates
+        main.rs            # crossterm event loop, screen state machine, popups, VaR analytics screen
+        data.rs            # pre-seeded portfolios, instruments, transactions, prices, FX rates, historical prices
     persistence/         # Postgres implementations (coming)
   frontend/            # Next.js app (to be scaffolded)
   shared/              # API schema contract (OpenAPI spec)
 ```
 
 ## Test Counts
-- **157 unit tests** (inline `#[cfg(test)]` across all source files, including 16 repository memory tests)
+- **161 unit tests** (inline `#[cfg(test)]` across all source files, including 16 repository memory tests and 4 risk tests)
 - **11 fold property tests** (`tests/fold_properties.rs`)
 - **5 valuation property tests** (`tests/valuation_properties.rs`)
 - **35 serde round-trip tests** (`tests/serde_roundtrip.rs`, `serde` feature)
-- **Total: 208 tests with all features, all passing**
+- **Total: 212 tests with all features, all passing**
 
 ## How to Extend
 1. Add new error variants to `DomainError` or `RepoError` if needed.
@@ -207,14 +209,19 @@ ptf_engine/
    - Define the trait with a sync method returning `Result<_, TypedError>`.
    - Provide a `Static*` in-memory impl for tests.
    - Add property tests in `tests/valuation_properties.rs` or a new file.
-6. For new repository traits, follow the pattern in `repository/`:
+6. For new risk analytics (e.g. new `compute_*` functions), follow the pattern in `risk.rs`:
+   - Add a `Config` struct with a sensible default constructor.
+   - Return a typed `Report` struct with per-asset and portfolio-level slices.
+   - Use `f64` only inside the statistical simulation; surface `Money` (Decimal) to callers.
+   - Add unit tests for edge cases (empty portfolio, flat prices, zero covariance).
+7. For new repository traits, follow the pattern in `repository/`:
    - Define the async trait in `repository/<name>.rs`.
    - Add an in-memory impl in `repository/memory.rs`.
    - Add tests in `repository/memory.rs` under `#[cfg(test)]`.
-7. For TUI changes, follow the pattern in `crates/tui/src/main.rs`:
+8. For TUI changes, follow the pattern in `crates/tui/src/main.rs`:
    - Keep all domain logic in `ptf-engine`; the TUI is pure presentation.
    - Pre-seed data in `crates/tui/src/data.rs` using `fold()` to derive `PortfolioState`.
-   - Use `StaticPriceProvider` and `StaticFxRateProvider` for mock prices/rates.
+   - Use `StaticPriceProvider`, `StaticFxRateProvider`, and `StaticHistoricalPriceProvider` for mock data.
    - Each screen is a `fn render_*` + a `fn handle_*_keys` pair.
    - Run `cargo clippy -p ptf-tui --all-features -- -D warnings` before committing.
-8. Update this file if conventions or deferred items change.
+9. Update this file if conventions or deferred items change.

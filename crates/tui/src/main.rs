@@ -4,29 +4,28 @@ use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
 
+use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use crossterm::ExecutableCommand;
+use ratatui::Frame;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState,
-};
-use ratatui::Frame;
-use ratatui::Terminal;
-use rust_decimal::prelude::ToPrimitive;
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 
 use ptf_engine::{
-    fold, Currency, FxRateProvider, Instrument, InstrumentId, LotSide, LotMethod, Money,
-    PortfolioState, Position, PriceProvider, TransactionKind,
+    Currency, FxRateProvider, Instrument, InstrumentId, LotMethod, LotSide, Money,
+    MonteCarloConfig, PortfolioState, Position, PriceProvider, TransactionKind, VaRReport,
+    compute_var, fold,
 };
 
-use crate::data::{seed_data, seed_data_us_growth, SeedData};
+use crate::data::{SeedData, seed_data, seed_data_us_growth};
 
 // ── App State ───────────────────────────────────────────────────────────
 
@@ -35,6 +34,7 @@ enum Screen {
     Dashboard,
     Ledger,
     LotInspector(InstrumentId),
+    Analytics,
 }
 
 enum Popup {
@@ -57,6 +57,8 @@ struct App {
     time_states: Vec<PortfolioState>,
     // Toggle bottom-right panel between Realized PnL and Currency Exposure
     show_currency_exposure: bool,
+    // Cached VaR report
+    var_report: Option<VaRReport>,
 }
 
 impl App {
@@ -75,6 +77,7 @@ impl App {
             time_index: 0,
             time_states: Vec::new(),
             show_currency_exposure: false,
+            var_report: None,
         };
         app.recompute_time_states();
         app
@@ -86,6 +89,7 @@ impl App {
             .map(|i| fold(&seed.transactions[..i], &seed.config).unwrap())
             .collect();
         self.time_index = seed.transactions.len();
+        self.var_report = None;
     }
 
     fn current_seed(&self) -> &SeedData {
@@ -98,6 +102,34 @@ impl App {
 
     fn current_valuation_base(&self) -> Currency {
         self.valuation_bases[self.valuation_idx % self.valuation_bases.len()]
+    }
+
+    fn compute_var_report(&mut self) -> &VaRReport {
+        if self.var_report.is_none() {
+            let seed = self.current_seed();
+            let state = self.display_state();
+            let config = MonteCarloConfig::default_var();
+            let report = compute_var(
+                state,
+                &seed.historical_prices,
+                &seed.fx,
+                &seed.prices,
+                &config,
+                seed.portfolio.base_currency,
+                seed.as_of,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("VaR computation failed: {e}");
+                VaRReport {
+                    as_of: seed.as_of,
+                    base_currency: seed.portfolio.base_currency,
+                    entries: Vec::new(),
+                    per_asset: Vec::new(),
+                }
+            });
+            self.var_report = Some(report);
+        }
+        self.var_report.as_ref().unwrap()
     }
 
     fn next_valuation_base(&mut self) {
@@ -179,8 +211,10 @@ fn text_bar(value: Decimal, max: Decimal, width: usize) -> String {
     }
     let ratio = (value / max).min(Decimal::ONE);
     #[allow(clippy::cast_possible_truncation)]
-    let filled =
-        (ratio * Decimal::from(width as u64)).to_u64().unwrap_or(0).min(width as u64) as usize;
+    let filled = (ratio * Decimal::from(width as u64))
+        .to_u64()
+        .unwrap_or(0)
+        .min(width as u64) as usize;
     let empty = width.saturating_sub(filled);
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
 }
@@ -246,9 +280,7 @@ fn side_label(pos: &Position) -> &'static str {
 fn format_decimal(d: Decimal) -> String {
     let s = d.normalize().to_string();
     if s.contains('.') {
-        s.trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_string()
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
     } else {
         s
     }
@@ -275,10 +307,7 @@ fn position_rows(
             let sym = position_symbol(pos, instruments).unwrap_or("?");
             let qty = pos.net_quantity();
             let side = side_label(pos);
-            let avg = pos
-                .long_cost_basis()
-                .amount
-                / pos.total_long_quantity().max(Decimal::ONE);
+            let avg = pos.long_cost_basis().amount / pos.total_long_quantity().max(Decimal::ONE);
             let avg_cost = if pos.is_short() {
                 pos.short_proceeds_basis()
             } else {
@@ -428,11 +457,25 @@ fn render_dashboard(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
     // Pre-compute all data from app before any mutable borrow.
-    let (title, base, total, time_as_of, time_label, time_gauge, rows, cash_rows, pnl_rows, exposure_rows) = {
+    let (
+        title,
+        base,
+        total,
+        time_as_of,
+        time_label,
+        time_gauge,
+        rows,
+        cash_rows,
+        pnl_rows,
+        exposure_rows,
+    ) = {
         let seed = app.current_seed();
         let base = seed.portfolio.base_currency;
         let total = app.compute_valuation(base);
-        let title = format!(" {} — {} ", seed.portfolio.name, seed.portfolio.base_currency);
+        let title = format!(
+            " {} — {} ",
+            seed.portfolio.name, seed.portfolio.base_currency
+        );
         let as_of = seed.as_of;
         let state = app.display_state();
         let rows = position_rows(
@@ -468,7 +511,11 @@ fn render_dashboard(f: &mut Frame, app: &mut App) {
                 .into_iter()
                 .map(|c| {
                     let pnl = state.realized_pnl_in(c);
-                    let color = if pnl >= Decimal::ZERO { Color::Green } else { Color::Red };
+                    let color = if pnl >= Decimal::ZERO {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    };
                     Row::new(vec![
                         Cell::from(c.to_string()),
                         Cell::from(format!("{}{}", currency_sym(c), format_money(pnl)))
@@ -488,7 +535,9 @@ fn render_dashboard(f: &mut Frame, app: &mut App) {
                     let base_v = if *c == base {
                         *v
                     } else {
-                        seed.fx.rate(*c, base, seed.as_of).map_or(Decimal::ZERO, |r| *v * r)
+                        seed.fx
+                            .rate(*c, base, seed.as_of)
+                            .map_or(Decimal::ZERO, |r| *v * r)
                     };
                     (*c, *v, base_v)
                 })
@@ -599,7 +648,13 @@ fn render_dashboard(f: &mut Frame, app: &mut App) {
     )
     .header(
         Row::new(vec![
-            "Symbol", "Side", "Qty", "Avg Cost", "Mkt Price", "Base Value", "Unrealized",
+            "Symbol",
+            "Side",
+            "Qty",
+            "Avg Cost",
+            "Mkt Price",
+            "Base Value",
+            "Unrealized",
         ])
         .style(Style::default().add_modifier(Modifier::BOLD)),
     )
@@ -620,13 +675,14 @@ fn render_dashboard(f: &mut Frame, app: &mut App) {
         .split(chunks[2]);
 
     // Cash (left side, always)
-    let cash_table =
-        Table::new(cash_rows, [Constraint::Percentage(30), Constraint::Percentage(70)])
-            .header(
-                Row::new(vec!["Currency", "Balance"])
-                    .style(Style::default().add_modifier(Modifier::BOLD)),
-            )
-            .block(Block::default().title(" Cash ").borders(Borders::ALL));
+    let cash_table = Table::new(
+        cash_rows,
+        [Constraint::Percentage(30), Constraint::Percentage(70)],
+    )
+    .header(
+        Row::new(vec!["Currency", "Balance"]).style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(Block::default().title(" Cash ").borders(Borders::ALL));
     f.render_widget(cash_table, bottom_chunks[0]);
 
     // Right side: Realized PnL OR Currency Exposure
@@ -643,16 +699,26 @@ fn render_dashboard(f: &mut Frame, app: &mut App) {
             Row::new(vec!["CCY", "Exposure", "Bar"])
                 .style(Style::default().add_modifier(Modifier::BOLD)),
         )
-        .block(Block::default().title(" Currency Exposure ").borders(Borders::ALL));
+        .block(
+            Block::default()
+                .title(" Currency Exposure ")
+                .borders(Borders::ALL),
+        );
         f.render_widget(exp_table, bottom_chunks[1]);
     } else {
-        let pnl_table =
-            Table::new(pnl_rows, [Constraint::Percentage(30), Constraint::Percentage(70)])
-                .header(
-                    Row::new(vec!["Currency", "Realized PnL"])
-                        .style(Style::default().add_modifier(Modifier::BOLD)),
-                )
-                .block(Block::default().title(" Realized PnL ").borders(Borders::ALL));
+        let pnl_table = Table::new(
+            pnl_rows,
+            [Constraint::Percentage(30), Constraint::Percentage(70)],
+        )
+        .header(
+            Row::new(vec!["Currency", "Realized PnL"])
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .block(
+            Block::default()
+                .title(" Realized PnL ")
+                .borders(Borders::ALL),
+        );
         f.render_widget(pnl_table, bottom_chunks[1]);
     }
 
@@ -787,8 +853,16 @@ fn render_lot_inspector(f: &mut Frame, app: &App, id: InstrumentId) {
         ],
     )
     .header(
-        Row::new(vec!["#", "Side", "Qty", "Basis", "Open Date", "Age", "Unrealized"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Row::new(vec![
+            "#",
+            "Side",
+            "Qty",
+            "Basis",
+            "Open Date",
+            "Age",
+            "Unrealized",
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .block(Block::default().borders(Borders::NONE));
 
@@ -796,30 +870,28 @@ fn render_lot_inspector(f: &mut Frame, app: &App, id: InstrumentId) {
 
     // Summary
     let net = total_long - total_short;
-    let summary_text = Text::from(vec![
-        Line::from(vec![
-            Span::styled("Total Long:  ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format_decimal(total_long),
-                Style::default().fg(Color::Green),
-            ),
-            Span::raw("   "),
-            Span::styled("Total Short: ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format_decimal(total_short),
-                Style::default().fg(Color::Red),
-            ),
-            Span::raw("   "),
-            Span::styled("Net: ", Style::default().fg(Color::Gray)),
-            Span::styled(format_decimal(net), Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("   "),
-            Span::styled("Unrealized: ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                money_str(Money::new(total_unrealized, inst.currency)),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]),
-    ]);
+    let summary_text = Text::from(vec![Line::from(vec![
+        Span::styled("Total Long:  ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            format_decimal(total_long),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw("   "),
+        Span::styled("Total Short: ", Style::default().fg(Color::Gray)),
+        Span::styled(format_decimal(total_short), Style::default().fg(Color::Red)),
+        Span::raw("   "),
+        Span::styled("Net: ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            format_decimal(net),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled("Unrealized: ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            money_str(Money::new(total_unrealized, inst.currency)),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ])]);
     let summary = Paragraph::new(summary_text).block(
         Block::default()
             .borders(Borders::TOP)
@@ -827,9 +899,133 @@ fn render_lot_inspector(f: &mut Frame, app: &App, id: InstrumentId) {
     );
     f.render_widget(summary, chunks[2]);
 
-    let help =
-        Paragraph::new("b back · q quit").style(Style::default().fg(Color::Gray));
+    let help = Paragraph::new("b back · q quit").style(Style::default().fg(Color::Gray));
     f.render_widget(help, chunks[3]);
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_analytics(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let report = app.compute_var_report().clone();
+    let seed = app.current_seed();
+
+    let block = Block::default()
+        .title(" Risk Analytics (VaR / CVaR) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(3), // header
+            Constraint::Min(6),    // VaR table
+            Constraint::Length(1), // divider
+            Constraint::Min(6),    // Asset risk table
+            Constraint::Length(1), // help
+        ])
+        .split(inner);
+
+    // Header
+    let header_text = Text::from(vec![
+        Line::from(vec![
+            Span::styled("Base Currency: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                seed.portfolio.base_currency.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled("Method: ", Style::default().fg(Color::Gray)),
+            Span::styled("Monte Carlo", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("   "),
+            Span::styled("Simulations: ", Style::default().fg(Color::Gray)),
+            Span::styled("10,000", Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("Horizon: ", Style::default().fg(Color::Gray)),
+            Span::styled("1d / 20d", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("   "),
+            Span::styled("Lookback: ", Style::default().fg(Color::Gray)),
+            Span::styled("252d", Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+    ]);
+    let header = Paragraph::new(header_text).block(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    f.render_widget(header, chunks[0]);
+
+    // VaR summary table
+    let mut var_rows: Vec<Row> = Vec::new();
+    for entry in &report.entries {
+        let conf_str = format!("{:.0}%", entry.confidence * Decimal::from(100));
+        let horizon_str = format!("{}", entry.horizon_days);
+        let var_str = money_str(entry.portfolio_var);
+        let cvar_str = money_str(entry.portfolio_cvar);
+        var_rows.push(Row::new(vec![
+            Cell::from(conf_str),
+            Cell::from(horizon_str),
+            Cell::from(var_str),
+            Cell::from(cvar_str),
+        ]));
+    }
+
+    let var_table = Table::new(
+        var_rows,
+        [
+            Constraint::Percentage(20),
+            Constraint::Percentage(20),
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+        ],
+    )
+    .header(
+        Row::new(vec!["Confidence", "Horizon", "VaR", "CVaR"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(Block::default().borders(Borders::NONE));
+
+    f.render_widget(var_table, chunks[1]);
+
+    // Asset risk table
+    let mut asset_rows: Vec<Row> = Vec::new();
+    for ar in &report.per_asset {
+        let symbol =
+            instrument_by_id(ar.instrument, &seed.instruments).map_or("?", |i| i.symbol.as_str());
+        let weight = format!("{:.1}%", ar.weight * Decimal::from(100));
+        let stand_var = money_str(ar.standalone_var);
+        let comp_cvar = money_str(ar.component_cvar);
+        asset_rows.push(Row::new(vec![
+            Cell::from(symbol),
+            Cell::from(weight),
+            Cell::from(stand_var),
+            Cell::from(comp_cvar),
+        ]));
+    }
+
+    let asset_table = Table::new(
+        asset_rows,
+        [
+            Constraint::Percentage(20),
+            Constraint::Percentage(20),
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+        ],
+    )
+    .header(
+        Row::new(vec!["Asset", "Weight", "Standalone VaR", "Component CVaR"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(Block::default().borders(Borders::NONE));
+
+    f.render_widget(asset_table, chunks[3]);
+
+    let help = Paragraph::new("b back · q quit").style(Style::default().fg(Color::Gray));
+    f.render_widget(help, chunks[4]);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -940,8 +1136,15 @@ fn render_ledger(f: &mut Frame, app: &App) {
         ],
     )
     .header(
-        Row::new(vec!["Date", "Kind", "Symbol", "Qty", "Price / Amount", "Fees"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Row::new(vec![
+            "Date",
+            "Kind",
+            "Symbol",
+            "Qty",
+            "Price / Amount",
+            "Fees",
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .block(Block::default().borders(Borders::NONE));
 
@@ -969,13 +1172,20 @@ fn render_valuation_popup(f: &mut Frame, app: &App, base: Currency, value: Money
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(2)
-        .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
     let header = Paragraph::new(Text::from(vec![
         Line::from(vec![
             Span::styled("Base Currency: ", Style::default().fg(Color::Gray)),
-            Span::styled(base.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                base.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Total Value:   ", Style::default().fg(Color::Gray)),
@@ -1018,9 +1228,7 @@ fn render_valuation_popup(f: &mut Frame, app: &App, base: Currency, value: Money
                 )));
             }
             Err(e) => {
-                rate_lines.push(Line::from(format!(
-                    "  {curr} → {base} = error: {e}"
-                )));
+                rate_lines.push(Line::from(format!("  {curr} → {base} = error: {e}")));
             }
         }
     }
@@ -1028,8 +1236,8 @@ fn render_valuation_popup(f: &mut Frame, app: &App, base: Currency, value: Money
     let rates = Paragraph::new(Text::from(rate_lines));
     f.render_widget(rates, chunks[1]);
 
-    let help = Paragraph::new("v cycle currency · Esc close")
-        .style(Style::default().fg(Color::Gray));
+    let help =
+        Paragraph::new("v cycle currency · Esc close").style(Style::default().fg(Color::Gray));
     f.render_widget(help, chunks[2]);
 }
 
@@ -1064,6 +1272,7 @@ fn handle_events(app: &mut App) -> io::Result<()> {
                     Screen::Dashboard => handle_dashboard_keys(app, key.code),
                     Screen::Ledger => handle_ledger_keys(app, key.code),
                     Screen::LotInspector(_) => handle_lot_inspector_keys(app, key.code),
+                    Screen::Analytics => handle_analytics_keys(app, key.code),
                 }
             }
         }
@@ -1149,6 +1358,10 @@ fn handle_dashboard_keys(app: &mut App, code: KeyCode) {
         KeyCode::Char('c' | 'C') => {
             app.show_currency_exposure = !app.show_currency_exposure;
         }
+        KeyCode::Char('a' | 'A') => {
+            app.compute_var_report();
+            app.screen = Screen::Analytics;
+        }
         // Time machine controls
         KeyCode::Char('[') => {
             app.time_index = app.time_index.saturating_sub(1);
@@ -1195,6 +1408,16 @@ fn handle_lot_inspector_keys(app: &mut App, code: KeyCode) {
     }
 }
 
+fn handle_analytics_keys(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Char('b' | 'B') | KeyCode::Esc => {
+            app.screen = Screen::Dashboard;
+        }
+        KeyCode::Char('q' | 'Q') => app.should_quit = true,
+        _ => {}
+    }
+}
+
 // ── Main ────────────────────────────────────────────────────────────────
 
 fn main() -> io::Result<()> {
@@ -1214,6 +1437,7 @@ fn main() -> io::Result<()> {
             Screen::Dashboard => render_dashboard(f, &mut app),
             Screen::Ledger => render_ledger(f, &app),
             Screen::LotInspector(id) => render_lot_inspector(f, &app, id),
+            Screen::Analytics => render_analytics(f, &mut app),
         })?;
 
         handle_events(&mut app)?;

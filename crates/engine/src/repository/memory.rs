@@ -306,10 +306,7 @@ mod tests {
         let repo = InMemoryTransactionRepository::new();
         let pid = PortfolioId::new();
         let d = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
-        let tx = tx(
-            d,
-            TransactionKind::deposit(usd("100.00")).unwrap(),
-        );
+        let tx = tx(d, TransactionKind::deposit(usd("100.00")).unwrap());
 
         repo.append(pid, &tx).await.unwrap();
         let list = repo.list(pid).await.unwrap();

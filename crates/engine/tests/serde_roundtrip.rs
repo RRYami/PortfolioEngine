@@ -6,12 +6,12 @@ mod serde_tests {
     use rust_decimal::Decimal;
     use serde_json;
 
-    use ptf_engine::{
-        CorporateAction, Currency, InstrumentId, LotId, LotMethod, LotSelection,
-        LotSelectionEntry, LotSide, Money, PortfolioConfig, PortfolioState, Transaction,
-        TransactionId, TransactionKind,
-    };
     use ptf_engine::fold;
+    use ptf_engine::{
+        CorporateAction, Currency, InstrumentId, LotId, LotMethod, LotSelection, LotSelectionEntry,
+        LotSide, Money, PortfolioConfig, PortfolioState, Transaction, TransactionId,
+        TransactionKind,
+    };
 
     fn usd(amount: &str) -> Money {
         Money::new(Decimal::from_str_exact(amount).unwrap(), Currency::USD)
@@ -50,7 +50,13 @@ mod serde_tests {
 
     #[test]
     fn currency_roundtrips() {
-        for &c in &[Currency::USD, Currency::EUR, Currency::GBP, Currency::JPY, Currency::CHF] {
+        for &c in &[
+            Currency::USD,
+            Currency::EUR,
+            Currency::GBP,
+            Currency::JPY,
+            Currency::CHF,
+        ] {
             let json = serde_json::to_string(&c).unwrap();
             let decoded: Currency = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, c);
@@ -214,12 +220,8 @@ mod serde_tests {
 
     #[test]
     fn transaction_kind_dividend_roundtrips() {
-        let kind = TransactionKind::dividend(
-            InstrumentId::new(),
-            usd("25.00"),
-            Some(date(15)),
-        )
-        .unwrap();
+        let kind =
+            TransactionKind::dividend(InstrumentId::new(), usd("25.00"), Some(date(15))).unwrap();
         let json = serde_json::to_string(&kind).unwrap();
         let decoded: TransactionKind = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, kind);
@@ -227,8 +229,9 @@ mod serde_tests {
 
     #[test]
     fn transaction_kind_corporate_action_split_roundtrips() {
-        let kind =
-            TransactionKind::CorporateAction(CorporateAction::split(InstrumentId::new(), Decimal::from(2)).unwrap());
+        let kind = TransactionKind::CorporateAction(
+            CorporateAction::split(InstrumentId::new(), Decimal::from(2)).unwrap(),
+        );
         let json = serde_json::to_string(&kind).unwrap();
         let decoded: TransactionKind = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, kind);
@@ -395,7 +398,8 @@ mod serde_tests {
                 TransactionId::new(),
                 date(2),
                 date(2),
-                TransactionKind::buy(inst, Decimal::from(10), usd("50.00"), usd("1.00"), None).unwrap(),
+                TransactionKind::buy(inst, Decimal::from(10), usd("50.00"), usd("1.00"), None)
+                    .unwrap(),
             )
             .unwrap(),
         ];
