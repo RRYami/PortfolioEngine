@@ -2,7 +2,7 @@
 
 ## Project
 Portfolio analytics engine — domain layer in Rust.
-Current focus: **TUI demo implemented.** Postgres persistence crate is next.
+Current focus: **Postgres persistence crate skeleton implemented.** Next: repository trait implementations (PortfolioRepository, TransactionRepository, InstrumentRepository).
 
 ## Tech Stack
 - **Language**: Rust stable, edition 2024
@@ -13,7 +13,7 @@ Current focus: **TUI demo implemented.** Postgres persistence crate is next.
 - **Errors**: `thiserror` for domain errors; `anyhow` only at application edges (not used yet)
 - **Testing**: built-in `#[cfg(test)]` + `proptest` for property-based tests
 - **Serialization**: `serde` behind optional feature flag; `rust_decimal/serde-with-str` for string-formatted Decimals
-- **Persistence**: `sqlx` with Postgres, no ORM (coming)
+- **Persistence**: `sqlx` with Postgres, no ORM. Embedded migrations via `sqlx::migrate!()`. `sqlx-cli` for migration authoring.
 - **Async traits**: `async-trait` for repository contracts
 - **TUI**: `ratatui` + `crossterm` for the demo binary (`crates/tui/`)
 
@@ -188,17 +188,22 @@ ptf_engine/
       src/
         main.rs            # crossterm event loop, screen state machine, popups, VaR analytics screen
         data.rs            # pre-seeded portfolios, instruments, transactions, prices, FX rates, historical prices
-    persistence/         # Postgres implementations (coming)
+    persistence/         # Postgres persistence implementations (ptf-persistence)
+      Cargo.toml
+      src/
+        lib.rs            # connection pool helpers, embedded migrations
+      migrations/
+        0001_initial.sql  # portfolios, instruments, transactions schema
   frontend/            # Next.js app (to be scaffolded)
   shared/              # API schema contract (OpenAPI spec)
 ```
 
 ## Test Counts
-- **161 unit tests** (inline `#[cfg(test)]` across all source files, including 16 repository memory tests and 4 risk tests)
+- **162 unit tests** (inline `#[cfg(test)]` across all source files, including 16 repository memory tests, 4 risk tests, and 1 persistence migration test)
 - **11 fold property tests** (`tests/fold_properties.rs`)
 - **5 valuation property tests** (`tests/valuation_properties.rs`)
 - **35 serde round-trip tests** (`tests/serde_roundtrip.rs`, `serde` feature)
-- **Total: 212 tests with all features, all passing**
+- **Total: 213 tests with all features, all passing**
 
 ## How to Extend
 1. Add new error variants to `DomainError` or `RepoError` if needed.

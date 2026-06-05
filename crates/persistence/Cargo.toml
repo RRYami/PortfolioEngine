@@ -1,0 +1,25 @@
+[package]
+name = "ptf-persistence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "ptf_persistence"
+
+[dependencies]
+ptf-engine = { path = "../engine", features = ["serde", "in-memory-repo"] }
+sqlx = { workspace = true, features = ["migrate"] }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rust_decimal = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

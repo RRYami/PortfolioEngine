@@ -950,6 +950,12 @@ fn render_analytics(f: &mut Frame, app: &mut App) {
             Span::raw("   "),
             Span::styled("Lookback: ", Style::default().fg(Color::Gray)),
             Span::styled("252d", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("   "),
+            Span::styled("As Of: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                report.as_of.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
         ]),
     ]);
     let header = Paragraph::new(header_text).block(

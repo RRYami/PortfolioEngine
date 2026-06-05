@@ -35,8 +35,9 @@ Implemented:
 - **Risk analytics**: Monte-Carlo VaR / CVaR with Cholesky-correlated sampling, configurable confidence levels / horizons / lookback, and per-asset component-VaR decomposition
 - **serde feature**: optional `Serialize`/`Deserialize` on all domain types for JSON persistence and API serialization
 - **Repository traits**: async `PortfolioRepository`, `TransactionRepository`, `InstrumentRepository` with thread-safe in-memory implementations
+- **Postgres persistence crate** (`crates/persistence/`): `sqlx`-based persistence with embedded migrations, connection pool helpers, and schema for portfolios, instruments, and transactions
 - **TUI binary** (`crates/tui/`): keyboard-driven demo for stakeholders — portfolio picker, dashboard with positions & cash, transaction ledger, full-screen lot inspector, time-machine replay, currency exposure bar chart, cross-currency valuation popup, and VaR analytics screen
-- 161 unit tests + 16 property tests + 35 serde round-trip tests, all passing
+- 162 unit tests (including 1 persistence migration test) + 16 property tests + 35 serde round-trip tests, all passing
 
 Deferred:
 - Postgres persistence
@@ -120,7 +121,12 @@ ptf_engine/
       src/
         main.rs            # crossterm event loop, screen state machine, popups, VaR analytics
         data.rs            # pre-seeded portfolios, instruments, transactions, prices, FX, historical prices
-    persistence/          # Postgres implementations (coming)
+    persistence/          # Postgres persistence (ptf-persistence)
+      Cargo.toml
+      src/
+        lib.rs             # connection pool helpers, embedded migrations
+      migrations/
+        0001_initial.sql   # portfolios, instruments, transactions schema
   frontend/             # Next.js app (to be scaffolded)
   shared/               # API schema contract (OpenAPI spec)
 ```
