@@ -2,6 +2,28 @@
 
 A Rust domain-layer engine for portfolio analytics. Transactions are the immutable source of truth; positions, cash balances, and realized PnL are derived by folding the transaction history.
 
+## Run the full stack (Docker)
+
+The web app — Rust analytics API, Python price service (yfinance → DuckDB →
+Parquet), Next.js dashboard, and Postgres — is orchestrated with Docker Compose:
+
+```bash
+make up      # build + start everything, dashboard on http://localhost:3000
+make logs    # tail logs
+make down    # stop
+```
+
+Services (see `docker-compose.yml`): `frontend` (:3000) → `api` (:8080) →
+`prices` (:8001), plus `postgres` (:5433). The `api` and `prices` containers
+share the `pricedata` volume — `prices` writes the Parquet snapshot, `api`
+reads it; they also talk over the network for ensure-on-add. Create a portfolio
+in the UI, add holdings (real prices are fetched live on first use), and the
+Rust engine computes the risk analytics.
+
+For frontend development with hot reload, run the backend in Docker
+(`docker compose up -d prices api`) and the dashboard locally
+(`cd frontend && PTF_API_URL=http://localhost:8080 npm run dev`).
+
 ## What it does
 
 - **Transaction-to-position fold**: given a chronologically ordered list of transactions (deposits, withdrawals, buys, sells, dividends, splits, fees), compute the resulting portfolio state — positions, per-currency cash, and realized PnL.
@@ -14,11 +36,11 @@ A Rust domain-layer engine for portfolio analytics. Transactions are the immutab
 - **Property-based tests**: 16 proptest invariants guard fold, FX, and valuation against regressions.
 - **Risk analytics (VaR/CVaR)**: Monte-Carlo `compute_var()` with Cholesky decomposition, configurable confidence levels and horizons, and per-asset component-VaR decomposition.
 - **Historical price provider**: `HistoricalPriceProvider` trait for lookback windows; `StaticHistoricalPriceProvider` for tests and demos.
-- **TUI Demo**: `cargo run -p ptf-tui` launches a `ratatui` read-only stakeholder demo with pre-seeded portfolios, a time-machine replay, lot-level inspector, currency exposure bars, live cross-currency valuation, and a VaR analytics screen.
+- **Web app**: an Axum analytics API (`crates/api/`) over the engine, a Python price service (yfinance → DuckDB → Parquet), and a Next.js dashboard — see [Run the full stack (Docker)](#run-the-full-stack-docker).
 
 ## Status
 
-**v1 fold and valuation complete. TUI demo implemented.**
+**v1 fold and valuation complete. Analytics API + web dashboard implemented.**
 
 Implemented:
 - Deposit, Withdrawal, Fee
@@ -36,12 +58,12 @@ Implemented:
 - **serde feature**: optional `Serialize`/`Deserialize` on all domain types for JSON persistence and API serialization
 - **Repository traits**: async `PortfolioRepository`, `TransactionRepository`, `InstrumentRepository` with thread-safe in-memory implementations
 - **Postgres persistence crate** (`crates/persistence/`): `sqlx`-based persistence with embedded migrations, connection pool helpers, and schema for portfolios, instruments, and transactions
-- **TUI binary** (`crates/tui/`): keyboard-driven demo for stakeholders — portfolio picker, dashboard with positions & cash, transaction ledger, full-screen lot inspector, time-machine replay, currency exposure bar chart, cross-currency valuation popup, and VaR analytics screen
+- **Analytics API** (`crates/api/`): Axum HTTP service over the engine — create portfolios, add holdings, and fetch a risk payload (VaR/ES, component VaR, positions, and chart series) computed by `compute_var`
+- **Price service + dashboard**: Python `services/prices/` (yfinance → DuckDB → Parquet) feeding the API, and a Next.js `frontend/` dashboard; the whole stack runs via Docker Compose
 - 162 unit tests (including 1 persistence migration test) + 16 property tests + 35 serde round-trip tests, all passing
 
 Deferred:
-- Postgres persistence
-- HTTP/API layer
+- Durable storage for portfolios (the API currently uses in-memory repositories; Postgres swap is wired but not yet enabled)
 - Snapshot caching for performance
 - Borrow fees, margin interest, derivatives
 
@@ -51,8 +73,8 @@ Deferred:
 # Build
 cargo build --workspace
 
-# Run the TUI demo
-cargo run -p ptf-tui
+# Run the analytics API (synthetic prices; set PTF_PRICES=parquet for the price service)
+cargo run -p ptf-api
 
 # Run all tests (domain only, no serde, no in-memory repo)
 cargo test --workspace
@@ -116,19 +138,23 @@ ptf_engine/
         fold_properties.rs       # proptest invariants for fold (11 properties)
         valuation_properties.rs  # proptest invariants for FX and valuation (5 properties)
         serde_roundtrip.rs       # serde round-trip tests (35 tests, serde feature)
-    tui/                  # TUI demo binary (ptf-tui)
-      Cargo.toml
+    api/                  # Axum HTTP API (ptf-api)
+      Dockerfile
       src/
-        main.rs            # crossterm event loop, screen state machine, popups, VaR analytics
-        data.rs            # pre-seeded portfolios, instruments, transactions, prices, FX, historical prices
+        main.rs            # server bootstrap + price-source selection (synthetic / parquet)
+        handlers.rs        # routes: portfolios, holdings, risk
+        risk_view.rs       # maps VaRReport + PortfolioState → dashboard JSON
+        charts.rs          # P&L distribution, drawdown, historical-VaR series
+        price_source.rs    # SyntheticPriceSource + ParquetPriceSource (reads Parquet)
     persistence/          # Postgres persistence (ptf-persistence)
       Cargo.toml
       src/
         lib.rs             # connection pool helpers, embedded migrations
       migrations/
         0001_initial.sql   # portfolios, instruments, transactions schema
-  frontend/             # Next.js app (to be scaffolded)
-  shared/               # API schema contract (OpenAPI spec)
+  services/
+    prices/               # Python price/FX service (yfinance → DuckDB → Parquet)
+  frontend/               # Next.js dashboard (risk desk UI)
 ```
 
 The domain layer (`crates/engine/src/`) has **zero I/O dependencies** — no `sqlx`, no HTTP, no file I/O. I/O boundaries are defined as traits (`PriceProvider`, `FxRateProvider`, `PortfolioRepository`, etc.) with concrete implementations living outside the domain.

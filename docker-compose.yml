@@ -15,5 +15,56 @@ services:
       timeout: 5s
       retries: 5
 
+  # Python price/FX service: yfinance -> DuckDB -> Parquet export.
+  prices:
+    build: ./services/prices
+    ports:
+      - "8001:8001"
+    volumes:
+      - pricedata:/data
+
+  # Rust analytics engine API. Reads the Parquet snapshot from the shared
+  # volume and calls the prices service over the network for ensure-on-add.
+  api:
+    build:
+      context: .
+      dockerfile: crates/api/Dockerfile
+    environment:
+      PTF_PRICES: parquet
+      PRICES_URL: http://prices:8001
+      PRICES_PARQUET: /data/prices.parquet
+      FX_PARQUET: /data/fx.parquet
+      PTF_API_ADDR: 0.0.0.0:8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - pricedata:/data:ro
+    depends_on:
+      prices:
+        condition: service_healthy
+
+  # Next.js dashboard. The browser hits the frontend's own /api proxies, which
+  # server-side fetch the engine API over the compose network.
+  frontend:
+    build: ./frontend
+    environment:
+      PTF_API_URL: http://api:8080
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
 volumes:
   pgdata:
+  pricedata:

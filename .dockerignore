@@ -1,0 +1,10 @@
+# Keep the Rust API build context small (context = repo root).
+target/
+**/node_modules
+frontend/.next
+services/prices/.venv
+services/prices/data
+**/__pycache__
+*.pyc
+.git
+design_handoff_risk_dashboard

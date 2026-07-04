@@ -15,20 +15,20 @@ Current focus: **Postgres persistence crate skeleton implemented.** Next: reposi
 - **Serialization**: `serde` behind optional feature flag; `rust_decimal/serde-with-str` for string-formatted Decimals
 - **Persistence**: `sqlx` with Postgres, no ORM. Embedded migrations via `sqlx::migrate!()`. `sqlx-cli` for migration authoring.
 - **Async traits**: `async-trait` for repository contracts
-- **TUI**: `ratatui` + `crossterm` for the demo binary (`crates/tui/`)
+- **Web API**: `axum` + `tower-http` for the HTTP service (`crates/api/`); `arrow`/`parquet` to read the price snapshot
 
 ## Build & Test
 ```bash
 # Compile workspace
 cargo build --workspace
 
-# Run the TUI demo
-cargo run -p ptf-tui
+# Run the analytics API
+cargo run -p ptf-api
 
 # Run all tests (domain only)
 cargo test --workspace
 
-# Run all tests with all features (serde + in-memory repo + TUI)
+# Run all tests with all features (serde + in-memory repo)
 cargo test --workspace --all-features
 
 # Run only property tests
@@ -183,19 +183,23 @@ ptf_engine/
         valuation_properties.rs  # proptest invariants for FX and valuation (5 properties)
         serde_roundtrip.rs       # serde round-trip tests (35 tests, serde feature)
 
-    tui/                 # TUI demo binary (ptf-tui)
-      Cargo.toml
+    api/                 # Axum HTTP API (ptf-api)
+      Dockerfile
       src/
-        main.rs            # crossterm event loop, screen state machine, popups, VaR analytics screen
-        data.rs            # pre-seeded portfolios, instruments, transactions, prices, FX rates, historical prices
+        main.rs            # server bootstrap + price-source selection
+        handlers.rs        # routes: portfolios, holdings, risk
+        risk_view.rs       # VaRReport + PortfolioState → dashboard JSON
+        charts.rs          # P&L distribution, drawdown, historical-VaR series
+        price_source.rs    # SyntheticPriceSource + ParquetPriceSource
     persistence/         # Postgres persistence implementations (ptf-persistence)
       Cargo.toml
       src/
         lib.rs            # connection pool helpers, embedded migrations
       migrations/
         0001_initial.sql  # portfolios, instruments, transactions schema
-  frontend/            # Next.js app (to be scaffolded)
-  shared/              # API schema contract (OpenAPI spec)
+  services/
+    prices/              # Python price/FX service (yfinance → DuckDB → Parquet)
+  frontend/              # Next.js dashboard (risk desk UI)
 ```
 
 ## Test Counts
@@ -223,10 +227,9 @@ ptf_engine/
    - Define the async trait in `repository/<name>.rs`.
    - Add an in-memory impl in `repository/memory.rs`.
    - Add tests in `repository/memory.rs` under `#[cfg(test)]`.
-8. For TUI changes, follow the pattern in `crates/tui/src/main.rs`:
-   - Keep all domain logic in `ptf-engine`; the TUI is pure presentation.
-   - Pre-seed data in `crates/tui/src/data.rs` using `fold()` to derive `PortfolioState`.
-   - Use `StaticPriceProvider`, `StaticFxRateProvider`, and `StaticHistoricalPriceProvider` for mock data.
-   - Each screen is a `fn render_*` + a `fn handle_*_keys` pair.
-   - Run `cargo clippy -p ptf-tui --all-features -- -D warnings` before committing.
+8. For API changes, follow the pattern in `crates/api/`:
+   - Keep all domain logic in `ptf-engine`; the API only orchestrates and shapes JSON.
+   - Add routes in `handlers.rs`; map engine output to the dashboard contract in `risk_view.rs`.
+   - Market data goes through the `PriceSource` trait (`price_source.rs`) — never read a feed directly.
+   - Run `cargo clippy -p ptf-api -- -D warnings` before committing.
 9. Update this file if conventions or deferred items change.

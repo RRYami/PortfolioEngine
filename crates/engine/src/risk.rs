@@ -67,12 +67,16 @@ pub struct AssetRisk {
 }
 
 /// Full Monte-Carlo risk report.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VaRReport {
     pub as_of: NaiveDate,
     pub base_currency: Currency,
     pub entries: Vec<VaREntry>,
     pub per_asset: Vec<AssetRisk>,
+    /// Simulated 1-day portfolio P&L sample in `base_currency`, **gain-positive**
+    /// (losses negative). Empty when there are no positions or zero volatility.
+    /// Lets callers render the P&L distribution without re-running the sim.
+    pub pnl_1d: Vec<f64>,
 }
 
 /// Errors that can occur during `VaR` computation.
@@ -123,6 +127,7 @@ pub fn compute_var(
             base_currency: base,
             entries: Vec::new(),
             per_asset: Vec::new(),
+            pnl_1d: Vec::new(),
         });
     }
 
@@ -175,6 +180,7 @@ pub fn compute_var(
             base_currency: base,
             entries,
             per_asset,
+            pnl_1d: Vec::new(),
         });
     }
 
@@ -321,11 +327,20 @@ pub fn compute_var(
         });
     }
 
+    // 1-day P&L sample, gain-positive (internal P&L is loss-positive).
+    let h1 = config
+        .horizon_days
+        .iter()
+        .position(|&d| d == 1)
+        .unwrap_or(0);
+    let pnl_1d: Vec<f64> = per_horizon_pnl[h1].iter().map(|&x| -x).collect();
+
     Ok(VaRReport {
         as_of,
         base_currency: base,
         entries,
         per_asset,
+        pnl_1d,
     })
 }
 
@@ -365,10 +380,9 @@ fn gather_assets(
         let value_native = qty * price.amount;
         let value_base = value_native * fx_rate;
 
-        // We need a symbol; callers should pass an Instrument slice or we
-        // use the Display of InstrumentId as fallback.  For now we leave the
-        // symbol resolution to the TUI layer (it already has the instrument
-        // list).  We store an empty string here and the caller can patch it.
+        // `PortfolioState` has no symbols, so we store an empty string and let
+        // the caller resolve it from its instrument list (e.g. the API layer
+        // maps `instrument` -> symbol when shaping the response).
         assets.push(AssetInput {
             instrument: *inst_id,
             symbol: String::new(),
