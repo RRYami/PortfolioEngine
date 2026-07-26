@@ -1,15 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use ptf_engine::{
-    Instrument, InstrumentId, InstrumentKind, InstrumentRepository, Money, Portfolio,
-    PortfolioConfig, PortfolioId, PortfolioRepository, Transaction, TransactionId, TransactionKind,
-    TransactionRepository, fold,
+    Currency, FxRateProvider, HistoricalPriceProvider, Instrument, InstrumentId, InstrumentKind,
+    InstrumentRepository, Money, Portfolio, PortfolioConfig, PortfolioId, PortfolioRepository,
+    Transaction, TransactionId, TransactionKind, TransactionRepository, fold,
 };
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::dto::{
@@ -17,9 +19,14 @@ use crate::dto::{
     parse_currency, parse_lot_method,
 };
 use crate::error::ApiError;
+use crate::perf_view::{self, BenchmarkSeries, PerformancePayload};
+use crate::positions_view::{self, PositionsPayload};
 use crate::price_source::HeldInstrument;
 use crate::risk_view::{self, RiskPayload};
 use crate::state::AppState;
+
+/// Default benchmark for the performance tab's relative stats.
+const DEFAULT_BENCHMARK: &str = "SPY";
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -27,7 +34,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/portfolios", get(list_portfolios).post(create_portfolio))
         .route("/api/portfolios/{id}", get(get_portfolio))
         .route("/api/portfolios/{id}/holdings", post(add_holding))
+        .route("/api/portfolios/{id}/positions", get(get_positions))
         .route("/api/portfolios/{id}/risk", get(get_risk))
+        .route("/api/portfolios/{id}/performance", get(get_performance))
         .with_state(state)
 }
 
@@ -134,8 +143,122 @@ async fn get_risk(
     let pid = parse_id(&id)?;
     let portfolio = app.portfolios.get(pid).await?;
     let state = fold_state(&app, &portfolio).await?;
+    let (holdings, names) = gather_holdings(&app, &state).await;
 
-    // Gather held-instrument metadata + a ticker→name map.
+    let as_of = Utc::now().date_naive();
+    let lookback = ptf_engine::MonteCarloConfig::default_var().lookback_days;
+    let pd = app.prices.build(&holdings, portfolio.base_currency, as_of, lookback)?;
+    let payload = risk_view::build(&portfolio, &state, &holdings, &names, &pd, as_of)?;
+    Ok(Json(payload))
+}
+
+async fn get_positions(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<PositionsPayload>, ApiError> {
+    let pid = parse_id(&id)?;
+    let portfolio = app.portfolios.get(pid).await?;
+    let state = fold_state(&app, &portfolio).await?;
+    let (holdings, names) = gather_holdings(&app, &state).await;
+
+    let as_of = Utc::now().date_naive();
+    // Positions only need spot + FX; reuse the same lookback so parquet/synthetic
+    // sources have a valid window to source the latest close from.
+    let lookback = ptf_engine::MonteCarloConfig::default_var().lookback_days;
+    let pd = app.prices.build(&holdings, portfolio.base_currency, as_of, lookback)?;
+    let payload = positions_view::build(&portfolio, &state, &holdings, &names, &pd, as_of)?;
+    Ok(Json(payload))
+}
+
+#[derive(Debug, Deserialize)]
+struct PerfQuery {
+    /// Annual risk-free rate as a fraction (e.g. `0.04`). Defaults to 0.
+    rf: Option<f64>,
+    /// Benchmark ticker for relative stats. Defaults to [`DEFAULT_BENCHMARK`].
+    benchmark: Option<String>,
+}
+
+async fn get_performance(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<PerfQuery>,
+) -> Result<Json<PerformancePayload>, ApiError> {
+    let pid = parse_id(&id)?;
+    let portfolio = app.portfolios.get(pid).await?;
+    let state = fold_state(&app, &portfolio).await?;
+    let (holdings, _names) = gather_holdings(&app, &state).await;
+
+    let as_of = Utc::now().date_naive();
+    let lookback = ptf_engine::MonteCarloConfig::default_var().lookback_days;
+    let pd = app.prices.build(&holdings, portfolio.base_currency, as_of, lookback)?;
+
+    // Benchmark is best-effort: if it can't be fetched/priced we still return the
+    // self-contained ratios, just without the `relative` block.
+    let bench_symbol = q
+        .benchmark
+        .unwrap_or_else(|| DEFAULT_BENCHMARK.to_string())
+        .to_uppercase();
+    let benchmark = benchmark_series(&app, portfolio.base_currency, as_of, lookback, &bench_symbol)
+        .await
+        .ok()
+        .flatten();
+
+    let rf = q.rf.unwrap_or(0.0);
+    let payload =
+        perf_view::build(&portfolio, &state, &pd, as_of, lookback, rf, benchmark.as_ref())?;
+    Ok(Json(payload))
+}
+
+/// Fetch + price a benchmark symbol and return its base-currency value on each
+/// historical date. `Ok(None)` when the price source has no data for it.
+async fn benchmark_series(
+    app: &AppState,
+    base: Currency,
+    as_of: chrono::NaiveDate,
+    lookback: u32,
+    symbol: &str,
+) -> Result<Option<BenchmarkSeries>, ApiError> {
+    // Ensure-on-read so the benchmark is available even if never held. Ignore
+    // failures — the caller degrades to no benchmark.
+    let _ = ensure_prices(app, symbol).await;
+
+    let bid = InstrumentId::new();
+    let holdings = vec![HeldInstrument {
+        id: bid,
+        symbol: symbol.to_string(),
+        currency: Currency::USD,
+    }];
+    let Ok(pd) = app.prices.build(&holdings, base, as_of, lookback) else {
+        return Ok(None);
+    };
+    let fx = pd
+        .fx
+        .rate(Currency::USD, base, as_of)
+        .ok()
+        .and_then(|r| r.to_f64())
+        .unwrap_or(1.0);
+    let from = as_of - Duration::days(i64::from(lookback));
+    let Ok(hist) = pd.historical.prices(bid, from, as_of) else {
+        return Ok(None);
+    };
+    let values: BTreeMap<_, _> = hist
+        .iter()
+        .map(|(d, m)| (*d, m.amount.to_f64().unwrap_or(0.0) * fx))
+        .collect();
+    if values.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(BenchmarkSeries {
+        symbol: symbol.to_string(),
+        values,
+    }))
+}
+
+/// Held-instrument metadata + a ticker→name map for the instruments in `state`.
+async fn gather_holdings(
+    app: &AppState,
+    state: &ptf_engine::PortfolioState,
+) -> (Vec<HeldInstrument>, HashMap<String, String>) {
     let mut holdings = Vec::new();
     let mut names = HashMap::new();
     for inst_id in state.positions().keys() {
@@ -148,12 +271,7 @@ async fn get_risk(
             });
         }
     }
-
-    let as_of = Utc::now().date_naive();
-    let lookback = ptf_engine::MonteCarloConfig::default_var().lookback_days;
-    let pd = app.prices.build(&holdings, portfolio.base_currency, as_of, lookback)?;
-    let payload = risk_view::build(&portfolio, &state, &holdings, &names, &pd, as_of)?;
-    Ok(Json(payload))
+    (holdings, names)
 }
 
 async fn fold_state(
@@ -167,11 +285,18 @@ async fn fold_state(
 
 /// Ask the Python prices service to fetch+cache+export a symbol. No-op when the
 /// service isn't configured (synthetic mode).
+///
+/// The service answers HTTP 200 even for an unknown ticker, reporting the
+/// failure per-symbol in the body (`{"symbols": {"XYZ": {"error": ...}}}`). We
+/// must surface that here as a `BadRequest`, because `add_holding` calls this
+/// *before* persisting: if a bad ticker slipped through, it would be saved with
+/// no price data and every later `/positions` and `/risk` load would 400.
 async fn ensure_prices(app: &AppState, ticker: &str) -> Result<(), ApiError> {
     let Some(url) = &app.prices_url else {
         return Ok(());
     };
-    let body = serde_json::json!({ "symbols": [ticker.to_uppercase()] });
+    let symbol = ticker.to_uppercase();
+    let body = serde_json::json!({ "symbols": [symbol] });
     let resp = reqwest::Client::new()
         .post(format!("{url}/ensure"))
         .json(&body)
@@ -184,5 +309,17 @@ async fn ensure_prices(app: &AppState, ticker: &str) -> Result<(), ApiError> {
             resp.status()
         )));
     }
-    Ok(())
+
+    let payload: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| ApiError::Internal(format!("bad prices response: {e}")))?;
+    let entry = payload.get("symbols").and_then(|s| s.get(&symbol));
+    match entry {
+        // A real fetch (fresh or cached) has no "error" key.
+        Some(e) if e.get("error").is_none() => Ok(()),
+        _ => Err(ApiError::BadRequest(format!(
+            "ticker '{symbol}' not found — check the symbol and try again"
+        ))),
+    }
 }

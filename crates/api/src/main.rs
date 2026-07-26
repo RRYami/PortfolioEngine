@@ -7,8 +7,11 @@
 
 mod charts;
 mod dto;
+mod equity;
 mod error;
 mod handlers;
+mod perf_view;
+mod positions_view;
 mod price_source;
 mod risk_view;
 mod state;

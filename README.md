@@ -18,7 +18,9 @@ Services (see `docker-compose.yml`): `frontend` (:3000) → `api` (:8080) →
 share the `pricedata` volume — `prices` writes the Parquet snapshot, `api`
 reads it; they also talk over the network for ensure-on-add. Create a portfolio
 in the UI, add holdings (real prices are fetched live on first use), and the
-Rust engine computes the risk analytics.
+Rust engine computes the analytics. The dashboard has two pages, switched from
+the sidebar: **Positions** (a sortable/filterable/paginated holdings table with
+per-lot drill-in) and **Risk** (VaR/ES, component VaR, and the chart series).
 
 For frontend development with hot reload, run the backend in Docker
 (`docker compose up -d prices api`) and the dashboard locally
@@ -58,7 +60,7 @@ Implemented:
 - **serde feature**: optional `Serialize`/`Deserialize` on all domain types for JSON persistence and API serialization
 - **Repository traits**: async `PortfolioRepository`, `TransactionRepository`, `InstrumentRepository` with thread-safe in-memory implementations
 - **Postgres persistence crate** (`crates/persistence/`): `sqlx`-based persistence with embedded migrations, connection pool helpers, and schema for portfolios, instruments, and transactions
-- **Analytics API** (`crates/api/`): Axum HTTP service over the engine — create portfolios, add holdings, and fetch a risk payload (VaR/ES, component VaR, positions, and chart series) computed by `compute_var`
+- **Analytics API** (`crates/api/`): Axum HTTP service over the engine — create portfolios, add holdings, fetch a positions view (holdings valued at spot with their tax lots) and a risk payload (VaR/ES, component VaR, positions, and chart series) computed by `compute_var`
 - **Price service + dashboard**: Python `services/prices/` (yfinance → DuckDB → Parquet) feeding the API, and a Next.js `frontend/` dashboard; the whole stack runs via Docker Compose
 - 162 unit tests (including 1 persistence migration test) + 16 property tests + 35 serde round-trip tests, all passing
 
@@ -142,8 +144,9 @@ ptf_engine/
       Dockerfile
       src/
         main.rs            # server bootstrap + price-source selection (synthetic / parquet)
-        handlers.rs        # routes: portfolios, holdings, risk
+        handlers.rs        # routes: portfolios, holdings, positions, risk
         risk_view.rs       # maps VaRReport + PortfolioState → dashboard JSON
+        positions_view.rs  # lightweight positions + tax-lot view (no Monte-Carlo)
         charts.rs          # P&L distribution, drawdown, historical-VaR series
         price_source.rs    # SyntheticPriceSource + ParquetPriceSource (reads Parquet)
     persistence/          # Postgres persistence (ptf-persistence)
@@ -154,7 +157,7 @@ ptf_engine/
         0001_initial.sql   # portfolios, instruments, transactions schema
   services/
     prices/               # Python price/FX service (yfinance → DuckDB → Parquet)
-  frontend/               # Next.js dashboard (risk desk UI)
+  frontend/               # Next.js dashboard — Positions + Risk pages with a shared sidebar shell
 ```
 
 The domain layer (`crates/engine/src/`) has **zero I/O dependencies** — no `sqlx`, no HTTP, no file I/O. I/O boundaries are defined as traits (`PriceProvider`, `FxRateProvider`, `PortfolioRepository`, etc.) with concrete implementations living outside the domain.

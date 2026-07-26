@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Dialog,
   DialogContent,
@@ -38,7 +38,14 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   });
   if (!r.ok) {
-    const msg = await r.text().catch(() => "");
+    const raw = await r.text().catch(() => "");
+    let msg = raw;
+    try {
+      const j = JSON.parse(raw);
+      if (j && typeof j.error === "string") msg = j.error;
+    } catch {
+      // non-JSON body — fall back to the raw text
+    }
     throw new Error(msg || `HTTP ${r.status}`);
   }
   return r.json() as Promise<T>;
@@ -156,13 +163,21 @@ export function AddHoldingDialog({
   defaultDate?: string;
   onAdded: () => void;
 }) {
+  const today = new Date().toISOString().slice(0, 10);
   const [ticker, setTicker] = useState("");
   const [name, setName] = useState("");
   const [quantity, setQuantity] = useState("");
   const [cost, setCost] = useState("");
   const [currency, setCurrency] = useState("USD");
+  const [date, setDate] = useState(defaultDate ?? today);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Seed the purchase date from the portfolio's inception each time the dialog
+  // opens; the user can then override it before saving.
+  useEffect(() => {
+    if (open) setDate(defaultDate ?? new Date().toISOString().slice(0, 10));
+  }, [open, defaultDate]);
 
   const submit = async () => {
     if (!portfolioId) return;
@@ -171,6 +186,7 @@ export function AddHoldingDialog({
     if (!ticker.trim()) return setError("Ticker is required");
     if (!(qty > 0)) return setError("Quantity must be positive");
     if (!(c > 0)) return setError("Cost must be positive");
+    if (!date) return setError("Purchase date is required");
     setBusy(true);
     setError(null);
     try {
@@ -180,7 +196,7 @@ export function AddHoldingDialog({
         quantity: qty,
         cost: c,
         currency,
-        date: defaultDate,
+        date,
       });
       onAdded();
       onOpenChange(false);
@@ -243,6 +259,14 @@ export function AddHoldingDialog({
               />
             </Field>
           </div>
+          <Field label="Purchase date">
+            <Input
+              type="date"
+              value={date}
+              max={today}
+              onChange={(e) => setDate(e.target.value)}
+            />
+          </Field>
           {error && <p className="text-sm text-red-400">{error}</p>}
         </div>
         <DialogFooter>

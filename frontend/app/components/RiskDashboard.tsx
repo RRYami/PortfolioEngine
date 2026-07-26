@@ -9,12 +9,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-} from "@/components/ui/select";
-import {
   Table,
   TableBody,
   TableCell,
@@ -24,10 +18,6 @@ import {
 } from "@/components/ui/table";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import type { PortfolioSummary } from "@/app/lib/portfolioTypes";
-import {
-  AddHoldingDialog,
-  NewPortfolioDialog,
-} from "@/app/components/PortfolioDialogs";
 
 type ChartKind = "dist" | "hist" | "dd";
 
@@ -222,25 +212,24 @@ function Tooltip({ tip }: { tip: Tip }) {
 
 const panelStyle: CSSProperties = { padding: "16px 18px" };
 
-export default function RiskDashboard() {
-  const [portfolios, setPortfolios] = useState<PortfolioSummary[] | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+export interface RiskDashboardProps {
+  selectedId: string | null;
+  selected: PortfolioSummary | null;
+  /** Bumped by the shell when a holding is added, to trigger a refetch. */
+  refreshToken: number;
+  onAddHolding: () => void;
+}
+
+export default function RiskDashboard({
+  selectedId,
+  selected,
+  refreshToken,
+  onAddHolding,
+}: RiskDashboardProps) {
   const [payload, setPayload] = useState<RiskPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [conf, setConf] = useState<Confidence>(95);
   const [hover, setHover] = useState<HoverState | null>(null);
-  const [newOpen, setNewOpen] = useState(false);
-  const [addOpen, setAddOpen] = useState(false);
-
-  const loadPortfolios = useCallback(() => {
-    return fetch("/api/portfolios", { cache: "no-store" })
-      .then((r) => (r.ok ? r.json() : []))
-      .then((list: PortfolioSummary[]) => {
-        setPortfolios(list);
-        setSelectedId((cur) => cur ?? list[0]?.id ?? null);
-      })
-      .catch(() => setPortfolios([]));
-  }, []);
 
   const loadRisk = useCallback((id: string | null) => {
     if (!id) return Promise.resolve();
@@ -257,14 +246,8 @@ export default function RiskDashboard() {
   }, []);
 
   useEffect(() => {
-    void loadPortfolios();
-  }, [loadPortfolios]);
-
-  useEffect(() => {
     void loadRisk(selectedId);
-  }, [selectedId, loadRisk]);
-
-  const selected = portfolios?.find((p) => p.id === selectedId) ?? null;
+  }, [selectedId, refreshToken, loadRisk]);
 
   const view = useMemo(
     () => (payload ? derive(payload, conf) : null),
@@ -288,82 +271,6 @@ export default function RiskDashboard() {
     };
   const onChartLeave = () => setHover(null);
 
-  const dialogs = (
-    <>
-      <NewPortfolioDialog
-        open={newOpen}
-        onOpenChange={setNewOpen}
-        onCreated={(p) => {
-          setPortfolios((prev) => [...(prev ?? []), p]);
-          setSelectedId(p.id);
-        }}
-      />
-      <AddHoldingDialog
-        open={addOpen}
-        onOpenChange={setAddOpen}
-        portfolioId={selectedId}
-        defaultDate={selected?.inceptionDate}
-        onAdded={() => void loadRisk(selectedId)}
-      />
-    </>
-  );
-
-  if (portfolios === null) {
-    return (
-      <div className="pe-page">
-        <div className="pe-card" style={{ padding: 40, color: "#6b7280" }}>
-          Connecting to engine…
-        </div>
-      </div>
-    );
-  }
-
-  if (portfolios.length === 0) {
-    return (
-      <div className="pe-page">
-        <div
-          className="pe-card"
-          style={{
-            padding: 48,
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "flex-start",
-            gap: 14,
-          }}
-        >
-          <div style={{ fontWeight: 800, fontSize: 18 }}>No portfolios yet</div>
-          <div style={{ color: "#9aa1b2", fontSize: 13 }}>
-            Create a book, add a few holdings, then run the analysis.
-          </div>
-          <Button
-            onClick={() => setNewOpen(true)}
-            style={{ background: "var(--accent)", color: "#fff", fontWeight: 700 }}
-          >
-            ＋ New portfolio
-          </Button>
-        </div>
-        {dialogs}
-      </div>
-    );
-  }
-
-  if (!view) {
-    return (
-      <div className="pe-page">
-        <div className="pe-card" style={{ padding: 40, color: "#6b7280" }}>
-          {error ? `Failed to load risk data: ${error}` : "Loading risk analytics…"}
-        </div>
-        {dialogs}
-      </div>
-    );
-  }
-
-  const distTip =
-    hover?.chart === "dist" ? buildTip(view, conf, hover) : null;
-  const histTip =
-    hover?.chart === "hist" ? buildTip(view, conf, hover) : null;
-  const ddTip = hover?.chart === "dd" ? buildTip(view, conf, hover) : null;
-
   const segBase: CSSProperties = {
     padding: "5px 12px",
     borderRadius: 7,
@@ -386,205 +293,96 @@ export default function RiskDashboard() {
     color: "#6b7280",
   };
 
-  return (
-    <div className="pe-page">
-      <div className="pe-card" data-screen-label="Risk Desk">
-        {/* topbar */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            padding: "15px 22px",
-            borderBottom: "1px solid rgba(255,255,255,.06)",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-            <div
-              style={{
-                width: 26,
-                height: 26,
-                borderRadius: 8,
-                background: "var(--accent)",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                boxShadow: "0 0 0 4px rgba(99,102,241,.12)",
-              }}
-            >
-              <div
-                style={{
-                  width: 9,
-                  height: 9,
-                  borderRadius: 2,
-                  background: "#fff",
-                }}
-              />
-            </div>
-            <div
-              style={{ fontWeight: 800, fontSize: 15, letterSpacing: "-.01em" }}
-            >
-              PortfolioEngine
-            </div>
-            <Select
-              value={selectedId ?? undefined}
-              onValueChange={(v) => setSelectedId(v)}
-            >
-              <SelectTrigger
-                className="h-auto gap-2 border-0"
-                style={{
-                  padding: "5px 11px",
-                  borderRadius: 9,
-                  background: "#14161d",
-                  border: "1px solid rgba(255,255,255,.07)",
-                  fontSize: 12,
-                  color: "#c5cad6",
-                }}
-              >
-                <span>{selected?.name ?? "Select portfolio"}</span>
-                <span style={{ color: "#4b5263" }}>·</span>
-                <span className="mono" style={{ color: "#9aa1b2" }}>
-                  {selected?.baseCcy ?? payload?.baseCcy ?? "USD"}
-                </span>
-              </SelectTrigger>
-              <SelectContent>
-                {portfolios.map((p) => (
-                  <SelectItem key={p.id} value={p.id}>
-                    {p.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Button
-              onClick={() => setNewOpen(true)}
-              variant="ghost"
-              title="New portfolio"
-              className="h-auto"
-              style={{
-                padding: "5px 10px",
-                borderRadius: 9,
-                background: "#14161d",
-                border: "1px solid rgba(255,255,255,.07)",
-                color: "#9aa1b2",
-                fontSize: 13,
-              }}
-            >
-              ＋
-            </Button>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-            <div className="mono" style={{ fontSize: 11.5, color: "#6b7280" }}>
-              {view.asOf}
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
-              <span className="pe-lbl">Confidence</span>
-              <ToggleGroup
-                value={[String(conf)]}
-                onValueChange={(g) => {
-                  if (g[0]) setConf(Number(g[0]) as Confidence);
-                }}
-                style={{
-                  background: "#14161d",
-                  border: "1px solid rgba(255,255,255,.07)",
-                  borderRadius: 9,
-                  padding: 2,
-                  gap: 0,
-                }}
-              >
-                <ToggleGroupItem value="95" style={conf === 95 ? segOn : segOff}>
-                  95%
-                </ToggleGroupItem>
-                <ToggleGroupItem value="99" style={conf === 99 ? segOn : segOff}>
-                  99%
-                </ToggleGroupItem>
-              </ToggleGroup>
-            </div>
-            <Button
-              onClick={() => setAddOpen(true)}
-              variant="ghost"
-              className="h-auto"
-              style={{
-                padding: "8px 14px",
-                borderRadius: 10,
-                background: "#14161d",
-                border: "1px solid rgba(255,255,255,.07)",
-                color: "#c5cad6",
-                fontWeight: 600,
-                fontSize: 12.5,
-              }}
-            >
-              ＋ Add Holding
-            </Button>
-            <Button
-              onClick={() => void loadRisk(selectedId)}
-              className="h-auto"
-              style={{
-                gap: 8,
-                padding: "8px 15px",
-                borderRadius: 10,
-                background: "var(--accent)",
-                color: "#fff",
-                fontWeight: 700,
-                fontSize: 12.5,
-                boxShadow: "0 6px 18px rgba(99,102,241,.35)",
-                cursor: "pointer",
-              }}
-            >
-              ▸ Run Analysis
-            </Button>
-          </div>
+  const controls = (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        marginBottom: 16,
+        gap: 16,
+      }}
+    >
+      <div>
+        <div style={{ fontWeight: 800, fontSize: 16, letterSpacing: "-.01em" }}>
+          Risk Analytics
         </div>
-
-        <div style={{ display: "flex" }}>
-          {/* rail */}
-          <div
+        <div className="pe-lbl" style={{ marginTop: 4 }}>
+          {selected?.name ?? "—"} · Value-at-Risk &amp; stress
+        </div>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+        {view && (
+          <div className="mono" style={{ fontSize: 11.5, color: "#6b7280" }}>
+            {view.asOf}
+          </div>
+        )}
+        <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+          <span className="pe-lbl">Confidence</span>
+          <ToggleGroup
+            value={[String(conf)]}
+            onValueChange={(g) => {
+              if (g[0]) setConf(Number(g[0]) as Confidence);
+            }}
             style={{
-              width: 58,
-              borderRight: "1px solid rgba(255,255,255,.06)",
-              padding: "16px 0",
-              display: "flex",
-              flexDirection: "column",
-              alignItems: "center",
-              gap: 10,
+              background: "#14161d",
+              border: "1px solid rgba(255,255,255,.07)",
+              borderRadius: 9,
+              padding: 2,
+              gap: 0,
             }}
           >
-            <div
-              style={{
-                width: 34,
-                height: 34,
-                borderRadius: 10,
-                background: "var(--accent)",
-                opacity: 0.16,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                color: "var(--accent)",
-                fontSize: 15,
-              }}
-            >
-              ◈
-            </div>
-            {["☰", "⤢", "⊞"].map((g) => (
-              <div
-                key={g}
-                style={{
-                  width: 34,
-                  height: 34,
-                  borderRadius: 10,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  color: "#6b7280",
-                  fontSize: 15,
-                }}
-              >
-                {g}
-              </div>
-            ))}
-          </div>
+            <ToggleGroupItem value="95" style={conf === 95 ? segOn : segOff}>
+              95%
+            </ToggleGroupItem>
+            <ToggleGroupItem value="99" style={conf === 99 ? segOn : segOff}>
+              99%
+            </ToggleGroupItem>
+          </ToggleGroup>
+        </div>
+        <Button
+          onClick={() => void loadRisk(selectedId)}
+          className="h-auto"
+          style={{
+            gap: 8,
+            padding: "8px 15px",
+            borderRadius: 10,
+            background: "var(--accent)",
+            color: "#fff",
+            fontWeight: 700,
+            fontSize: 12.5,
+            boxShadow: "0 6px 18px rgba(99,102,241,.35)",
+            cursor: "pointer",
+          }}
+        >
+          ▸ Run Analysis
+        </Button>
+      </div>
+    </div>
+  );
 
-          {/* main */}
-          <div style={{ flex: 1, padding: "18px 20px", minWidth: 0 }}>
+  if (!view) {
+    return (
+      <div style={{ flex: 1, padding: "18px 20px", minWidth: 0 }}>
+        {controls}
+        <div className="pe-panel" style={{ padding: 40, color: "#6b7280" }}>
+          {error
+            ? `Failed to load risk data: ${error}`
+            : "Loading risk analytics…"}
+        </div>
+      </div>
+    );
+  }
+
+  const distTip =
+    hover?.chart === "dist" ? buildTip(view, conf, hover) : null;
+  const histTip =
+    hover?.chart === "hist" ? buildTip(view, conf, hover) : null;
+  const ddTip = hover?.chart === "dd" ? buildTip(view, conf, hover) : null;
+
+  return (
+    <div style={{ flex: 1, padding: "18px 20px", minWidth: 0 }}>
+      {controls}
             {payload?.positions.length === 0 && (
               <div
                 style={{
@@ -605,7 +403,7 @@ export default function RiskDashboard() {
                   This book has no holdings yet — add one to see live analytics.
                 </span>
                 <Button
-                  onClick={() => setAddOpen(true)}
+                  onClick={onAddHolding}
                   className="h-auto"
                   style={{
                     flexShrink: 0,
@@ -1284,10 +1082,6 @@ export default function RiskDashboard() {
                 </div>
               </div>
             </div>
-          </div>
-        </div>
-      </div>
-      {dialogs}
     </div>
   );
 }

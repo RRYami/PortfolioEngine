@@ -5,17 +5,16 @@
 //! real engine. The three chart series (distribution, drawdown, historical `VaR`)
 //! are still synthetic in Phase 1 — see `charts.rs` — and flagged accordingly.
 
-use std::collections::{BTreeMap, BTreeSet};
-
-use chrono::{Duration, NaiveDate};
+use chrono::NaiveDate;
 use ptf_engine::{
-    FxRateProvider, HistoricalPriceProvider, MonteCarloConfig, Portfolio, PortfolioState,
-    PriceProvider, VaRReport, compute_var,
+    FxRateProvider, MonteCarloConfig, Portfolio, PortfolioState, PriceProvider, VaRReport,
+    compute_var,
 };
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
 
 use crate::charts;
+use crate::equity;
 use crate::error::ApiError;
 use crate::price_source::{HeldInstrument, PriceData};
 
@@ -226,7 +225,9 @@ pub fn build(
     let pnl_distribution =
         charts::pnl_distribution(&report.pnl_1d, (var1d95, es1d95), (var1d99, es1d99));
     // Drawdown + historical VaR from the portfolio's equity curve over the window.
-    let (equity, dates) = equity_series(state, pd, base, as_of, cfg.lookback_days)?;
+    let (equity, date_vec) =
+        equity::series(state, pd, base, as_of, cfg.lookback_days, Some(CHART_DAYS))?;
+    let dates = equity::iso(&date_vec);
     let drawdown = charts::drawdown(&equity, &dates);
     let hist_var = charts::historical_var(&equity, &dates, total, var1d95, var1d99);
 
@@ -245,48 +246,6 @@ pub fn build(
         pnl_distribution,
         synthetic_charts: false,
     })
-}
-
-/// Portfolio equity curve over the trailing window: current holdings valued at
-/// each historical date (FX held at `as_of`). Returns `(equity, iso_dates)`,
-/// oldest→newest, on the dates where **every** held instrument has a price.
-fn equity_series(
-    state: &PortfolioState,
-    pd: &PriceData,
-    base: ptf_engine::Currency,
-    as_of: NaiveDate,
-    lookback_days: u32,
-) -> Result<(Vec<f64>, Vec<String>), ApiError> {
-    let from = as_of - Duration::days(i64::from(lookback_days));
-    let mut maps: Vec<BTreeMap<NaiveDate, f64>> = Vec::new();
-    let mut common: Option<BTreeSet<NaiveDate>> = None;
-
-    for (inst_id, pos) in state.positions() {
-        let qty = f(pos.net_quantity());
-        let fx = f(pd.fx.rate(pos.currency(), base, as_of)?);
-        let series = pd.historical.prices(*inst_id, from, as_of)?;
-        let map: BTreeMap<NaiveDate, f64> = series
-            .iter()
-            .map(|(d, m)| (*d, f(m.amount) * qty * fx))
-            .collect();
-        let dates: BTreeSet<NaiveDate> = map.keys().copied().collect();
-        common = Some(match common {
-            None => dates,
-            Some(c) => c.intersection(&dates).copied().collect(),
-        });
-        maps.push(map);
-    }
-
-    let mut dates: Vec<NaiveDate> = common.unwrap_or_default().into_iter().collect();
-    if dates.len() > CHART_DAYS {
-        dates = dates.split_off(dates.len() - CHART_DAYS);
-    }
-    let equity: Vec<f64> = dates
-        .iter()
-        .map(|d| maps.iter().filter_map(|m| m.get(d)).sum())
-        .collect();
-    let iso: Vec<String> = dates.iter().map(|d| d.format("%Y-%m-%d").to_string()).collect();
-    Ok((equity, iso))
 }
 
 fn pct(x: f64, total: f64) -> f64 {
