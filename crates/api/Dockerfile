@@ -3,7 +3,7 @@ FROM rust:1-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-# Only ptf-api (+ ptf-engine) is compiled; persistence/tui are not pulled in.
+# Compiles ptf-api plus its deps (ptf-engine, ptf-persistence).
 RUN cargo build --release -p ptf-api
 
 FROM debian:bookworm-slim

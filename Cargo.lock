@@ -1858,6 +1858,7 @@ dependencies = [
  "chrono",
  "parquet",
  "ptf-engine",
+ "ptf-persistence",
  "reqwest",
  "rust_decimal",
  "serde",
@@ -1891,6 +1892,7 @@ dependencies = [
 name = "ptf-persistence"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "ptf-engine",
  "rust_decimal",

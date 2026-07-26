@@ -1,6 +1,8 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    # TimescaleDB on PG16. Note: a volume initialized by plain postgres must be
+    # wiped (make db-reset) — TimescaleDB needs shared_preload_libraries.
+    image: timescale/timescaledb:2.17.2-pg16
     environment:
       POSTGRES_USER: ptf
       POSTGRES_PASSWORD: ptf
@@ -35,12 +37,15 @@ services:
       PRICES_PARQUET: /data/prices.parquet
       FX_PARQUET: /data/fx.parquet
       PTF_API_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgres://ptf:ptf@postgres:5432/ptf_engine
     ports:
       - "8080:8080"
     volumes:
       - pricedata:/data:ro
     depends_on:
       prices:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   # Next.js dashboard. The browser hits the frontend's own /api proxies, which

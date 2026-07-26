@@ -1,9 +1,10 @@
 //! HTTP API for the portfolio analytics engine.
 //!
-//! Thin Axum layer over `ptf-engine`: portfolios + holdings CRUD (in-memory)
-//! and a `/risk` endpoint that folds transactions into a `PortfolioState`,
-//! runs `compute_var`, and shapes the result into the dashboard's JSON
-//! contract. Market data is supplied by a pluggable [`PriceSource`].
+//! Thin Axum layer over `ptf-engine`: portfolios + holdings CRUD (Postgres
+//! when `DATABASE_URL` is set, in-memory otherwise) and a `/risk` endpoint
+//! that folds transactions into a `PortfolioState`, runs `compute_var`, and
+//! shapes the result into the dashboard's JSON contract. Market data is
+//! supplied by a pluggable [`PriceSource`].
 
 mod charts;
 mod dto;
@@ -19,6 +20,11 @@ mod state;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ptf_engine::{
+    InMemoryInstrumentRepository, InMemoryPortfolioRepository, InMemoryTransactionRepository,
+    InstrumentRepository, PortfolioRepository, TransactionRepository,
+};
+use ptf_persistence::{PgInstrumentRepository, PgPortfolioRepository, PgTransactionRepository};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -44,6 +50,33 @@ fn price_source() -> (Arc<dyn PriceSource>, Option<String>) {
     }
 }
 
+/// Build the repositories from env. When `DATABASE_URL` is set the API runs
+/// on Postgres (embedded migrations are applied on boot); otherwise it falls
+/// back to throwaway in-memory repositories.
+async fn repositories() -> (
+    Arc<dyn PortfolioRepository>,
+    Arc<dyn TransactionRepository>,
+    Arc<dyn InstrumentRepository>,
+) {
+    if let Ok(url) = std::env::var("DATABASE_URL") {
+        let pool = ptf_persistence::create_pool(&url)
+            .await
+            .expect("DATABASE_URL is set but the database is unreachable or migrations failed");
+        tracing::info!("storage: postgres (migrated)");
+        return (
+            Arc::new(PgPortfolioRepository::new(pool.clone())),
+            Arc::new(PgTransactionRepository::new(pool.clone())),
+            Arc::new(PgInstrumentRepository::new(pool)),
+        );
+    }
+    tracing::info!("storage: in-memory (set DATABASE_URL for postgres)");
+    (
+        Arc::new(InMemoryPortfolioRepository::new()),
+        Arc::new(InMemoryTransactionRepository::new()),
+        Arc::new(InMemoryInstrumentRepository::new()),
+    )
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -54,7 +87,8 @@ async fn main() {
         .init();
 
     let (prices, prices_url) = price_source();
-    let state = AppState::new(prices, prices_url);
+    let (portfolios, transactions, instruments) = repositories().await;
+    let state = AppState::new(portfolios, transactions, instruments, prices, prices_url);
     let app = handlers::router(state)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());

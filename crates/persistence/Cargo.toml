@@ -12,6 +12,7 @@ ptf-engine = { path = "../engine", features = ["serde", "in-memory-repo"] }
 sqlx = { workspace = true, features = ["migrate"] }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

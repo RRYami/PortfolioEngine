@@ -2,7 +2,7 @@
 
 ## Project
 Portfolio analytics engine — domain layer in Rust.
-Current focus: **Postgres persistence crate skeleton implemented.** Next: repository trait implementations (PortfolioRepository, TransactionRepository, InstrumentRepository).
+Current focus: **Postgres persistence implemented** — TimescaleDB in Docker, `Pg*Repository` trait implementations, API wired via `DATABASE_URL`. Next: snapshot caching / performance work.
 
 ## Tech Stack
 - **Language**: Rust stable, edition 2024
@@ -13,7 +13,7 @@ Current focus: **Postgres persistence crate skeleton implemented.** Next: reposi
 - **Errors**: `thiserror` for domain errors; `anyhow` only at application edges (not used yet)
 - **Testing**: built-in `#[cfg(test)]` + `proptest` for property-based tests
 - **Serialization**: `serde` behind optional feature flag; `rust_decimal/serde-with-str` for string-formatted Decimals
-- **Persistence**: `sqlx` with Postgres, no ORM. Embedded migrations via `sqlx::migrate!()`. `sqlx-cli` for migration authoring.
+- **Persistence**: `sqlx` with Postgres + TimescaleDB (`timescale/timescaledb:2.17.2-pg16`), no ORM. Embedded migrations via `sqlx::migrate!()`. `sqlx-cli` for migration authoring. Runtime-checked queries (no `query!` macros, no `.sqlx` offline data).
 - **Async traits**: `async-trait` for repository contracts
 - **Web API**: `axum` + `tower-http` for the HTTP service (`crates/api/`); `arrow`/`parquet` to read the price snapshot
 
@@ -22,10 +22,10 @@ Current focus: **Postgres persistence crate skeleton implemented.** Next: reposi
 # Compile workspace
 cargo build --workspace
 
-# Run the analytics API
+# Run the analytics API (in-memory; DATABASE_URL switches to Postgres)
 cargo run -p ptf-api
 
-# Run all tests (domain only)
+# Run all tests (Postgres tests skip unless `make db-up` was run)
 cargo test --workspace
 
 # Run all tests with all features (serde + in-memory repo)
@@ -55,7 +55,7 @@ make test       # cargo test --workspace
 - **Domain layer** (`crates/engine/src/`) must remain dependency-free: no `sqlx`, no HTTP, no file I/O.
 - **Repository traits** live in `crates/engine/src/repository/` (async, trait-only).
 - **In-memory implementations** live in `crates/engine/src/repository/memory.rs`, gated by `#[cfg(any(test, feature = "in-memory-repo"))]`.
-- **Postgres implementations** will live in `crates/persistence/` (coming).
+- **Postgres implementations** live in `crates/persistence/src/{portfolio,transaction,instrument}.rs` as `Pg*Repository` structs over a shared `sqlx::PgPool`. The API selects storage by env: `DATABASE_URL` set → Postgres (migrations applied on boot), unset → in-memory.
 - I/O boundaries are traits: `PriceProvider`, `FxRateProvider`, `PortfolioRepository`, `TransactionRepository`, `InstrumentRepository`.
 
 ### Cargo features
@@ -94,6 +94,15 @@ make test       # cargo test --workspace
 - `InstrumentRepository::upsert` enforces symbol uniqueness: same symbol with different `InstrumentId` returns `RepoError::AlreadyExists`.
 - Errors are explicit: `RepoError::NotFound`, `AlreadyExists`, `Conflict`, `Serialization`, `Database`.
 
+### Postgres schema and `Pg*` implementations
+- `transactions` is the only **TimescaleDB hypertable** (partitioned by `trade_date`, 1-month chunks) — the domain's append-only, time-ranged event log. `portfolios`/`instruments` are plain reference tables.
+- Hypertable constraint: any unique index must include the partition column, so the PK is `(id, trade_date)`. Insertion order is preserved by a `seq BIGINT GENERATED ALWAYS AS IDENTITY` column; `list`/`list_until` use `ORDER BY trade_date, seq` (matches the memory impl's tiebreak).
+- Enum-ish columns (`portfolios.lot_method`, `instruments.kind`) are JSONB and mapped with `sqlx::types::Json<T>` straight through serde — no parallel string-mapping code. `Currency` columns are `CHAR(3)` ↔ `Currency` via its validating `TryFrom<&str>`.
+- Error mapping (`persistence/src/error.rs`): `RowNotFound` and FK violations (`23503`) → `NotFound`; unique violations (`23505`) → `AlreadyExists`. Note `PgTransactionRepository::append` is stricter than memory: appending to a missing portfolio errors (the FK enforces it).
+- The `pgdata` volume is wiped when switching Postgres images (`make db-reset`) — TimescaleDB needs `shared_preload_libraries`, so a volume initialized by plain `postgres:16-alpine` cannot be reused.
+- DB tests use a **fresh small pool per test** (`test_util::test_pool`), never a shared static pool: pooled connections created on a dropped tokio runtime become zombies (`PoolTimedOut`). Tests skip gracefully when the DB is unreachable.
+- DB tests run against a dedicated **`ptf_engine_test`** database (auto-created on first run; override with `TEST_DATABASE_URL`) so fixtures never pollute the dev database or dashboard.
+
 ### Serialization
 - `serde` is an optional feature. When enabled:
   - `Currency` serializes as `"USD"` (custom impl, not derived from `[u8; 3]`)
@@ -113,6 +122,7 @@ make test       # cargo test --workspace
 
 ## Testing Conventions
 - **Unit tests**: inline `#[cfg(test)]` modules per file for type-internal invariants.
+- **Postgres tests**: use `test_util::test_pool()` (per-test pool, skip when DB is down) against the `ptf_engine_test` database — never the dev `ptf_engine` database.
 - **Integration tests**: `tests/` directory for end-to-end and property-based tests.
 - **Property tests**: `tests/fold_properties.rs` (11 properties) and `tests/valuation_properties.rs` (5 properties) using `proptest`. Default 256 cases per property.
 - **Serde tests**: `tests/serde_roundtrip.rs` (35 tests), compiled only with `serde` feature. Round-trip every domain type through JSON.
@@ -132,13 +142,11 @@ make test       # cargo test --workspace
 11. `Portfolio` (metadata) and `PortfolioState` (derived) are separate types. Metadata is persisted; state is always re-derived from transactions.
 
 ## Deferred (do not implement unprompted)
-- Postgres schema and migrations
-- HTTP/API layer
-- Web frontend (Next.js)
 - Authentication / multi-tenancy
 - Borrow fees and margin interest accounting
 - Options, futures, derivatives
 - Snapshot caching for performance
+- TimescaleDB extras: compression, retention policies, continuous aggregates
 
 ## File Layout
 ```
@@ -195,19 +203,26 @@ ptf_engine/
       Cargo.toml
       src/
         lib.rs            # connection pool helpers, embedded migrations
+        error.rs          # sqlx → RepoError mapping (23505/23503)
+        portfolio.rs      # PgPortfolioRepository
+        transaction.rs    # PgTransactionRepository (hypertable)
+        instrument.rs     # PgInstrumentRepository
+        test_util.rs      # DB-test pool helper (skips when DB is down)
       migrations/
-        0001_initial.sql  # portfolios, instruments, transactions schema
+        0001_initial.sql  # schema + TimescaleDB hypertable
   services/
     prices/              # Python price/FX service (yfinance → DuckDB → Parquet)
   frontend/              # Next.js dashboard (risk desk UI)
 ```
 
 ## Test Counts
-- **162 unit tests** (inline `#[cfg(test)]` across all source files, including 16 repository memory tests, 4 risk tests, and 1 persistence migration test)
+- **161 engine unit tests** (inline `#[cfg(test)]` across all source files, including 16 repository memory tests and 4 risk tests)
+- **23 persistence tests** (2 migration/hypertable smoke tests + 21 `Pg*Repository` tests; need `make db-up`, skip gracefully without it)
+- **6 API unit tests** (inline in `crates/api/`)
 - **11 fold property tests** (`tests/fold_properties.rs`)
 - **5 valuation property tests** (`tests/valuation_properties.rs`)
 - **35 serde round-trip tests** (`tests/serde_roundtrip.rs`, `serde` feature)
-- **Total: 213 tests with all features, all passing**
+- **Total: 241 tests with all features, all passing**
 
 ## How to Extend
 1. Add new error variants to `DomainError` or `RepoError` if needed.
@@ -226,7 +241,8 @@ ptf_engine/
 7. For new repository traits, follow the pattern in `repository/`:
    - Define the async trait in `repository/<name>.rs`.
    - Add an in-memory impl in `repository/memory.rs`.
-   - Add tests in `repository/memory.rs` under `#[cfg(test)]`.
+   - Add a Postgres impl in `crates/persistence/src/<name>.rs` (migration + `Pg*` struct + error mapping via `map_sqlx`).
+   - Add tests: memory tests under `#[cfg(test)]`; DB tests using `test_util::test_pool()` (skip when DB is down).
 8. For API changes, follow the pattern in `crates/api/`:
    - Keep all domain logic in `ptf-engine`; the API only orchestrates and shapes JSON.
    - Add routes in `handlers.rs`; map engine output to the dashboard contract in `risk_view.rs`.

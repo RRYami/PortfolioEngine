@@ -5,7 +5,8 @@ A Rust domain-layer engine for portfolio analytics. Transactions are the immutab
 ## Run the full stack (Docker)
 
 The web app — Rust analytics API, Python price service (yfinance → DuckDB →
-Parquet), Next.js dashboard, and Postgres — is orchestrated with Docker Compose:
+Parquet), Next.js dashboard, and Postgres (TimescaleDB) — is orchestrated with
+Docker Compose:
 
 ```bash
 make up      # build + start everything, dashboard on http://localhost:3000
@@ -14,9 +15,11 @@ make down    # stop
 ```
 
 Services (see `docker-compose.yml`): `frontend` (:3000) → `api` (:8080) →
-`prices` (:8001), plus `postgres` (:5433). The `api` and `prices` containers
-share the `pricedata` volume — `prices` writes the Parquet snapshot, `api`
-reads it; they also talk over the network for ensure-on-add. Create a portfolio
+`prices` (:8001), plus `postgres` (:5433, TimescaleDB). The `api` and `prices`
+containers share the `pricedata` volume — `prices` writes the Parquet snapshot,
+`api` reads it; they also talk over the network for ensure-on-add. Portfolios,
+instruments, and transactions are stored durably in Postgres (the `pgdata`
+volume); the API applies embedded migrations on boot. Create a portfolio
 in the UI, add holdings (real prices are fetched live on first use), and the
 Rust engine computes the analytics. The dashboard has two pages, switched from
 the sidebar: **Positions** (a sortable/filterable/paginated holdings table with
@@ -59,13 +62,12 @@ Implemented:
 - **Risk analytics**: Monte-Carlo VaR / CVaR with Cholesky-correlated sampling, configurable confidence levels / horizons / lookback, and per-asset component-VaR decomposition
 - **serde feature**: optional `Serialize`/`Deserialize` on all domain types for JSON persistence and API serialization
 - **Repository traits**: async `PortfolioRepository`, `TransactionRepository`, `InstrumentRepository` with thread-safe in-memory implementations
-- **Postgres persistence crate** (`crates/persistence/`): `sqlx`-based persistence with embedded migrations, connection pool helpers, and schema for portfolios, instruments, and transactions
+- **Postgres persistence crate** (`crates/persistence/`): `sqlx`-based `Pg*Repository` implementations of the three repository traits, embedded migrations, and connection pool helpers. `transactions` is a TimescaleDB hypertable partitioned by `trade_date`; portfolios and instruments stay plain reference tables.
 - **Analytics API** (`crates/api/`): Axum HTTP service over the engine — create portfolios, add holdings, fetch a positions view (holdings valued at spot with their tax lots) and a risk payload (VaR/ES, component VaR, positions, and chart series) computed by `compute_var`
 - **Price service + dashboard**: Python `services/prices/` (yfinance → DuckDB → Parquet) feeding the API, and a Next.js `frontend/` dashboard; the whole stack runs via Docker Compose
-- 162 unit tests (including 1 persistence migration test) + 16 property tests + 35 serde round-trip tests, all passing
+- 190 unit tests (including 23 Postgres repository tests) + 16 property tests + 35 serde round-trip tests, all passing
 
 Deferred:
-- Durable storage for portfolios (the API currently uses in-memory repositories; Postgres swap is wired but not yet enabled)
 - Snapshot caching for performance
 - Borrow fees, margin interest, derivatives
 
@@ -75,8 +77,10 @@ Deferred:
 # Build
 cargo build --workspace
 
-# Run the analytics API (synthetic prices; set PTF_PRICES=parquet for the price service)
+# Run the analytics API (in-memory storage + synthetic prices;
+# set DATABASE_URL for Postgres and PTF_PRICES=parquet for the price service)
 cargo run -p ptf-api
+DATABASE_URL=postgres://ptf:ptf@localhost:5433/ptf_engine cargo run -p ptf-api
 
 # Run all tests (domain only, no serde, no in-memory repo)
 cargo test --workspace
@@ -104,7 +108,7 @@ make psql
 ptf_engine/
   Cargo.toml              # workspace root
   Cargo.lock              # workspace lockfile
-  docker-compose.yml      # postgres:16-alpine on port 5433
+  docker-compose.yml      # TimescaleDB (timescale/timescaledb:2.17.2-pg16) on port 5433
   Makefile                # db-up, db-down, db-reset, test, etc.
   .env                    # DATABASE_URL for local dev
   crates/
@@ -153,8 +157,13 @@ ptf_engine/
       Cargo.toml
       src/
         lib.rs             # connection pool helpers, embedded migrations
+        error.rs           # sqlx → RepoError mapping (23505/23503)
+        portfolio.rs       # PgPortfolioRepository
+        transaction.rs     # PgTransactionRepository (hypertable)
+        instrument.rs      # PgInstrumentRepository
+        test_util.rs       # DB-test pool helper (skips when DB is down)
       migrations/
-        0001_initial.sql   # portfolios, instruments, transactions schema
+        0001_initial.sql   # schema + TimescaleDB hypertable
   services/
     prices/               # Python price/FX service (yfinance → DuckDB → Parquet)
   frontend/               # Next.js dashboard — Positions + Risk pages with a shared sidebar shell
