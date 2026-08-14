@@ -103,16 +103,20 @@ mod tests {
     use rust_decimal::Decimal;
 
     use ptf_engine::currency::Currency;
-    use ptf_engine::ids::TransactionId;
+    use ptf_engine::ids::{TransactionId, UserId};
     use ptf_engine::lot_method::LotMethod;
     use ptf_engine::money::Money;
     use ptf_engine::portfolio::Portfolio;
     use ptf_engine::repository::portfolio::PortfolioRepository;
     use ptf_engine::transaction::TransactionKind;
 
+    use ptf_engine::repository::user::UserRepository;
+    use ptf_engine::user::User;
+
     use super::*;
     use crate::portfolio::PgPortfolioRepository;
     use crate::test_util::test_pool;
+    use crate::user::PgUserRepository;
 
     fn usd(dollars: &str) -> Money {
         Money::new(Decimal::from_str_exact(dollars).unwrap(), Currency::USD)
@@ -124,9 +128,19 @@ mod tests {
 
     /// Creates a fresh portfolio (transactions reference it via FK).
     async fn new_portfolio(pool: &PgPool) -> PortfolioId {
+        let users = PgUserRepository::new(pool.clone());
+        let u = User::new(
+            UserId::new(),
+            format!("{}@example.com", Uuid::new_v4().simple()),
+            "hash",
+            NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+        );
+        users.create(&u).await.unwrap();
+
         let repo = PgPortfolioRepository::new(pool.clone());
         let p = Portfolio::new(
             PortfolioId::new(),
+            u.id,
             format!("tx-test-{}", Uuid::new_v4()),
             Currency::USD,
             LotMethod::Fifo,

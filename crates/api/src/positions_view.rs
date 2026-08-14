@@ -87,7 +87,10 @@ pub fn build(
         total_mv += mv_base;
 
         let ticker = meta.map_or_else(|| inst_id.0.to_string(), |m| m.symbol.clone());
-        let name = names.get(&ticker).cloned().unwrap_or_else(|| ticker.clone());
+        let name = names
+            .get(&ticker)
+            .cloned()
+            .unwrap_or_else(|| ticker.clone());
 
         let lots: Vec<LotView> = pos
             .long_lots()
@@ -114,7 +117,11 @@ pub fn build(
             cost_basis: cost_base,
             weight_pct: 0.0, // filled below
             unrealized_pnl: upnl_base,
-            unrealized_pnl_pct: if cost_base == 0.0 { 0.0 } else { upnl_base / cost_base * 100.0 },
+            unrealized_pnl_pct: if cost_base == 0.0 {
+                0.0
+            } else {
+                upnl_base / cost_base * 100.0
+            },
             lots,
         });
     }

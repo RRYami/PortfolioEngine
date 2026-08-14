@@ -21,6 +21,7 @@ pub mod price;
 pub mod repository;
 pub mod risk;
 pub mod transaction;
+pub mod user;
 pub mod valuation;
 
 pub use currency::Currency;
@@ -28,7 +29,7 @@ pub use error::DomainError;
 pub use fold::fold;
 pub use fx::{FxError, FxRateProvider, StaticFxRateProvider, TriangulatingFxProvider};
 pub use historical_price::{HistoricalPriceProvider, StaticHistoricalPriceProvider};
-pub use ids::{InstrumentId, LotId, PortfolioId, TransactionId};
+pub use ids::{InstrumentId, LotId, PortfolioId, TransactionId, UserId};
 pub use instrument::{Instrument, InstrumentKind};
 pub use lot::Lot;
 pub use lot_method::{LotMethod, LotSelection, LotSelectionEntry, LotSide};
@@ -38,12 +39,16 @@ pub use portfolio_config::PortfolioConfig;
 pub use portfolio_state::PortfolioState;
 pub use position::Position;
 pub use price::{PriceError, PriceProvider, StaticPriceProvider};
-pub use repository::{InstrumentRepository, PortfolioRepository, RepoError, TransactionRepository};
+pub use repository::{
+    InstrumentRepository, PortfolioRepository, RepoError, TransactionRepository, UserRepository,
+};
 pub use risk::{AssetRisk, MonteCarloConfig, RiskError, VaREntry, VaRReport, compute_var};
 pub use transaction::{CorporateAction, Transaction, TransactionKind};
+pub use user::User;
 pub use valuation::ValuationError;
 
 #[cfg(any(test, feature = "in-memory-repo"))]
 pub use repository::memory::{
     InMemoryInstrumentRepository, InMemoryPortfolioRepository, InMemoryTransactionRepository,
+    InMemoryUserRepository,
 };

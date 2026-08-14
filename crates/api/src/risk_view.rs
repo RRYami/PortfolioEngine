@@ -127,8 +127,12 @@ fn entry(report: &VaRReport, conf: f64, horizon: u32) -> (f64, f64) {
     report
         .entries
         .iter()
-        .find(|e| (e.confidence.to_f64().unwrap_or(0.0) - conf).abs() < 1e-9 && e.horizon_days == horizon)
-        .map_or((0.0, 0.0), |e| (f(e.portfolio_var.amount), f(e.portfolio_cvar.amount)))
+        .find(|e| {
+            (e.confidence.to_f64().unwrap_or(0.0) - conf).abs() < 1e-9 && e.horizon_days == horizon
+        })
+        .map_or((0.0, 0.0), |e| {
+            (f(e.portfolio_var.amount), f(e.portfolio_cvar.amount))
+        })
 }
 
 /// Build the dashboard payload. `holdings` carries symbol/name/ccy metadata for
@@ -143,23 +147,12 @@ pub fn build(
 ) -> Result<RiskPayload, ApiError> {
     let base = portfolio.base_currency;
     let cfg = MonteCarloConfig::default_var();
-    let report = compute_var(
-        state,
-        &pd.historical,
-        &pd.fx,
-        &pd.prices,
-        &cfg,
-        base,
-        as_of,
-    )?;
+    let report = compute_var(state, &pd.historical, &pd.fx, &pd.prices, &cfg, base, as_of)?;
 
-    let total = f(state
-        .total_value(&pd.fx, &pd.prices, base, as_of)?
-        .amount);
+    let total = f(state.total_value(&pd.fx, &pd.prices, base, as_of)?.amount);
 
     // ---- positions ----
-    let by_id: std::collections::HashMap<_, _> =
-        holdings.iter().map(|h| (h.id, h)).collect();
+    let by_id: std::collections::HashMap<_, _> = holdings.iter().map(|h| (h.id, h)).collect();
     let mut rows: Vec<PositionRow> = Vec::new();
     let mut total_mv = 0.0;
     for (inst_id, pos) in state.positions() {
@@ -174,7 +167,10 @@ pub fn build(
         let upnl_base = (mv_native - cost_native) * fx;
         total_mv += mv_base;
         let ticker = meta.map_or_else(|| inst_id.0.to_string(), |m| m.symbol.clone());
-        let name = names.get(&ticker).cloned().unwrap_or_else(|| ticker.clone());
+        let name = names
+            .get(&ticker)
+            .cloned()
+            .unwrap_or_else(|| ticker.clone());
         rows.push(PositionRow {
             ticker,
             name,
@@ -261,7 +257,11 @@ fn component_shares(
     report: &VaRReport,
     by_id: &std::collections::HashMap<ptf_engine::InstrumentId, &HeldInstrument>,
 ) -> Vec<Share> {
-    let sum: f64 = report.per_asset.iter().map(|a| f(a.component_cvar.amount)).sum();
+    let sum: f64 = report
+        .per_asset
+        .iter()
+        .map(|a| f(a.component_cvar.amount))
+        .sum();
     let mut v: Vec<Share> = report
         .per_asset
         .iter()
@@ -271,7 +271,11 @@ fn component_shares(
             ticker: by_id
                 .get(&a.instrument)
                 .map_or_else(|| a.symbol.clone(), |h| h.symbol.clone()),
-            share: if sum == 0.0 { 0.0 } else { f(a.component_cvar.amount) / sum },
+            share: if sum == 0.0 {
+                0.0
+            } else {
+                f(a.component_cvar.amount) / sum
+            },
         })
         .collect();
     v.sort_by(|a, b| b.share.partial_cmp(&a.share).unwrap());

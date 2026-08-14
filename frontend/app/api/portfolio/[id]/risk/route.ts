@@ -1,5 +1,5 @@
 import { computeRiskPayload } from "@/app/lib/computeRisk";
-import { PTF_API_URL, passthrough } from "@/app/lib/apiBase";
+import { PTF_API_URL, forward } from "@/app/lib/apiBase";
 
 // GET /api/portfolio/{id}/risk
 //
@@ -7,15 +7,12 @@ import { PTF_API_URL, passthrough } from "@/app/lib/apiBase";
 // transactions into a PortfolioState and runs compute_var. If the engine is
 // unreachable, falls back to the labelled seeded mock so the UI still renders.
 export async function GET(
-  _req: Request,
+  req: Request,
   ctx: { params: Promise<{ id: string }> },
 ) {
   const { id } = await ctx.params;
   try {
-    const r = await fetch(`${PTF_API_URL}/api/portfolios/${id}/risk`, {
-      cache: "no-store",
-    });
-    return passthrough(r.status, await r.text());
+    return await forward(req, `${PTF_API_URL}/api/portfolios/${id}/risk`);
   } catch {
     // Engine offline — serve the mock so the dashboard still works.
     return Response.json({ ...computeRiskPayload(id), mock: true });

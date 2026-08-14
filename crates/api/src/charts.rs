@@ -14,7 +14,11 @@ const WINDOW: usize = 20;
 /// (var1d, es1d) at a confidence level.
 pub type Tail = (f64, f64);
 
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 pub fn pnl_distribution(pnl: &[f64], c95: Tail, c99: Tail) -> PnlDistribution {
     if pnl.len() < 2 {
         return PnlDistribution {
@@ -78,7 +82,11 @@ pub fn drawdown(equity: &[f64], dates: &[String]) -> Drawdown {
     let mut max_pct = 0.0f64;
     for &e in equity {
         peak = peak.max(e);
-        let dd = if peak > 0.0 { (e / peak - 1.0) * 100.0 } else { 0.0 };
+        let dd = if peak > 0.0 {
+            (e / peak - 1.0) * 100.0
+        } else {
+            0.0
+        };
         max_pct = max_pct.min(dd);
         series.push((dd * 100.0).round() / 100.0);
     }
@@ -137,7 +145,13 @@ pub fn historical_var(
 
     HistVar {
         dates: dates.to_vec(),
-        var1d_pct: ByConf { c95: v1d95, c99: v1d99 },
-        var20d_pct: ByConf { c95: v20d95, c99: v20d99 },
+        var1d_pct: ByConf {
+            c95: v1d95,
+            c99: v1d99,
+        },
+        var20d_pct: ByConf {
+            c95: v20d95,
+            c99: v20d99,
+        },
     }
 }

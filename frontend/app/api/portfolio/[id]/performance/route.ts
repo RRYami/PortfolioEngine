@@ -1,4 +1,4 @@
-import { PTF_API_URL, passthrough } from "@/app/lib/apiBase";
+import { PTF_API_URL, forward } from "@/app/lib/apiBase";
 
 // GET /api/portfolio/{id}/performance?rf=&benchmark=
 //
@@ -11,8 +11,5 @@ export async function GET(
 ) {
   const { id } = await ctx.params;
   const qs = new URL(req.url).search;
-  const r = await fetch(`${PTF_API_URL}/api/portfolios/${id}/performance${qs}`, {
-    cache: "no-store",
-  });
-  return passthrough(r.status, await r.text());
+  return forward(req, `${PTF_API_URL}/api/portfolios/${id}/performance${qs}`);
 }

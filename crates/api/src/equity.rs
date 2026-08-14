@@ -65,5 +65,8 @@ pub fn series(
 
 /// ISO-8601 (`YYYY-MM-DD`) strings for a date vector — the JSON contract.
 pub fn iso(dates: &[NaiveDate]) -> Vec<String> {
-    dates.iter().map(|d| d.format("%Y-%m-%d").to_string()).collect()
+    dates
+        .iter()
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .collect()
 }

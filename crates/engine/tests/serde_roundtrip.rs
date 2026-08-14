@@ -10,7 +10,7 @@ mod serde_tests {
     use ptf_engine::{
         CorporateAction, Currency, InstrumentId, LotId, LotMethod, LotSelection, LotSelectionEntry,
         LotSide, Money, PortfolioConfig, PortfolioState, Transaction, TransactionId,
-        TransactionKind,
+        TransactionKind, UserId,
     };
 
     fn usd(amount: &str) -> Money {
@@ -104,6 +104,14 @@ mod serde_tests {
         let id = LotId::new();
         let json = serde_json::to_string(&id).unwrap();
         let decoded: LotId = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, id);
+    }
+
+    #[test]
+    fn user_id_roundtrips() {
+        let id = UserId::new();
+        let json = serde_json::to_string(&id).unwrap();
+        let decoded: UserId = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, id);
     }
 

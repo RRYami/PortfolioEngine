@@ -1,7 +1,7 @@
 use chrono::NaiveDate;
 
 use crate::currency::Currency;
-use crate::ids::PortfolioId;
+use crate::ids::{PortfolioId, UserId};
 use crate::lot_method::LotMethod;
 
 /// Metadata for a portfolio.
@@ -12,6 +12,8 @@ use crate::lot_method::LotMethod;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Portfolio {
     pub id: PortfolioId,
+    /// Owner of this portfolio.
+    pub user_id: UserId,
     pub name: String,
     pub base_currency: Currency,
     pub lot_method: LotMethod,
@@ -26,6 +28,7 @@ pub struct Portfolio {
 impl Portfolio {
     pub fn new(
         id: PortfolioId,
+        user_id: UserId,
         name: impl Into<String>,
         base_currency: Currency,
         lot_method: LotMethod,
@@ -34,6 +37,7 @@ impl Portfolio {
         let now = inception_date;
         Self {
             id,
+            user_id,
             name: name.into(),
             base_currency,
             lot_method,

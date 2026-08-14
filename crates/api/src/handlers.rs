@@ -7,13 +7,16 @@ use chrono::{Duration, Utc};
 use ptf_engine::{
     Currency, FxRateProvider, HistoricalPriceProvider, Instrument, InstrumentId, InstrumentKind,
     Money, Portfolio, PortfolioConfig, PortfolioId, Transaction, TransactionId, TransactionKind,
-    fold,
+    UserId, fold,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::Deserialize;
+use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::key_extractor::PeerIpKeyExtractor;
 use uuid::Uuid;
 
+use crate::auth::{self, SessionUser};
 use crate::dto::{
     AddHoldingReq, CreatePortfolioReq, PortfolioDetail, PortfolioSummary, PositionView,
     parse_currency, parse_lot_method,
@@ -29,9 +32,28 @@ use crate::state::AppState;
 const DEFAULT_BENCHMARK: &str = "SPY";
 
 pub fn router(state: AppState) -> Router {
+    // Login and register are rate-limited per client IP against brute force.
+    let limited_auth = Router::new()
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/register", post(auth::register))
+        .layer(tower_governor::GovernorLayer::new(
+            GovernorConfigBuilder::default()
+                .per_second(60)
+                .burst_size(5)
+                .key_extractor(PeerIpKeyExtractor)
+                .finish()
+                .expect("valid governor config"),
+        ));
+
     Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/api/portfolios", get(list_portfolios).post(create_portfolio))
+        .route("/api/auth/me", get(auth::me))
+        .route("/api/auth/logout", post(auth::logout))
+        .merge(limited_auth)
+        .route(
+            "/api/portfolios",
+            get(list_portfolios).post(create_portfolio),
+        )
         .route("/api/portfolios/{id}", get(get_portfolio))
         .route("/api/portfolios/{id}/holdings", post(add_holding))
         .route("/api/portfolios/{id}/positions", get(get_positions))
@@ -46,38 +68,66 @@ fn parse_id(id: &str) -> Result<PortfolioId, ApiError> {
         .map_err(|_| ApiError::BadRequest(format!("invalid portfolio id: {id}")))
 }
 
+/// Loads the portfolio, requiring ownership: 404 when it is missing **or**
+/// owned by someone else (no cross-tenant enumeration).
+async fn owned_portfolio(
+    app: &AppState,
+    user_id: UserId,
+    pid: PortfolioId,
+) -> Result<Portfolio, ApiError> {
+    let portfolio = app.portfolios.get(pid).await?;
+    if portfolio.user_id != user_id {
+        return Err(ApiError::NotFound);
+    }
+    Ok(portfolio)
+}
+
 async fn list_portfolios(
+    user: SessionUser,
     State(app): State<AppState>,
 ) -> Result<Json<Vec<PortfolioSummary>>, ApiError> {
-    let list = app.portfolios.list().await?;
+    let list = app.portfolios.list(user.0.id).await?;
     Ok(Json(list.iter().map(PortfolioSummary::from).collect()))
 }
 
 async fn create_portfolio(
+    user: SessionUser,
     State(app): State<AppState>,
     Json(req): Json<CreatePortfolioReq>,
 ) -> Result<Json<PortfolioSummary>, ApiError> {
     let base = parse_currency(&req.base_ccy)?;
     let lot_method = parse_lot_method(&req.lot_method)?;
-    let inception = req.inception_date.unwrap_or_else(|| Utc::now().date_naive());
-    let portfolio = Portfolio::new(PortfolioId::new(), req.name, base, lot_method, inception);
+    let inception = req
+        .inception_date
+        .unwrap_or_else(|| Utc::now().date_naive());
+    let portfolio = Portfolio::new(
+        PortfolioId::new(),
+        user.0.id,
+        req.name,
+        base,
+        lot_method,
+        inception,
+    );
     app.portfolios.create(&portfolio).await?;
     Ok(Json(PortfolioSummary::from(&portfolio)))
 }
 
 async fn get_portfolio(
+    user: SessionUser,
     State(app): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<PortfolioDetail>, ApiError> {
     let pid = parse_id(&id)?;
-    let portfolio = app.portfolios.get(pid).await?;
+    let portfolio = owned_portfolio(&app, user.0.id, pid).await?;
     let state = fold_state(&app, &portfolio).await?;
 
     let mut positions = Vec::new();
     for (inst_id, pos) in state.positions() {
         let inst = app.instruments.get(*inst_id).await.ok();
         positions.push(PositionView {
-            ticker: inst.as_ref().map_or_else(|| inst_id.0.to_string(), |i| i.symbol.clone()),
+            ticker: inst
+                .as_ref()
+                .map_or_else(|| inst_id.0.to_string(), |i| i.symbol.clone()),
             name: inst.as_ref().map_or_else(String::new, |i| i.name.clone()),
             ccy: pos.currency().to_string(),
             quantity: pos.net_quantity(),
@@ -90,12 +140,13 @@ async fn get_portfolio(
 }
 
 async fn add_holding(
+    user: SessionUser,
     State(app): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<AddHoldingReq>,
 ) -> Result<Json<PortfolioSummary>, ApiError> {
     let pid = parse_id(&id)?;
-    let portfolio = app.portfolios.get(pid).await?;
+    let portfolio = owned_portfolio(&app, user.0.id, pid).await?;
     let ccy = parse_currency(&req.currency)?;
     if req.quantity <= Decimal::ZERO {
         return Err(ApiError::BadRequest("quantity must be positive".into()));
@@ -109,7 +160,9 @@ async fn add_holding(
     ensure_prices(&app, &req.ticker).await?;
 
     // Register the instrument (idempotent by symbol).
-    let inst_id = if let Ok(existing) = app.instruments.by_symbol(&req.ticker).await { existing.id } else {
+    let inst_id = if let Ok(existing) = app.instruments.by_symbol(&req.ticker).await {
+        existing.id
+    } else {
         let inst = Instrument {
             id: InstrumentId::new(),
             symbol: req.ticker.clone(),
@@ -137,27 +190,31 @@ async fn add_holding(
 }
 
 async fn get_risk(
+    user: SessionUser,
     State(app): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<RiskPayload>, ApiError> {
     let pid = parse_id(&id)?;
-    let portfolio = app.portfolios.get(pid).await?;
+    let portfolio = owned_portfolio(&app, user.0.id, pid).await?;
     let state = fold_state(&app, &portfolio).await?;
     let (holdings, names) = gather_holdings(&app, &state).await;
 
     let as_of = Utc::now().date_naive();
     let lookback = ptf_engine::MonteCarloConfig::default_var().lookback_days;
-    let pd = app.prices.build(&holdings, portfolio.base_currency, as_of, lookback)?;
+    let pd = app
+        .prices
+        .build(&holdings, portfolio.base_currency, as_of, lookback)?;
     let payload = risk_view::build(&portfolio, &state, &holdings, &names, &pd, as_of)?;
     Ok(Json(payload))
 }
 
 async fn get_positions(
+    user: SessionUser,
     State(app): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<PositionsPayload>, ApiError> {
     let pid = parse_id(&id)?;
-    let portfolio = app.portfolios.get(pid).await?;
+    let portfolio = owned_portfolio(&app, user.0.id, pid).await?;
     let state = fold_state(&app, &portfolio).await?;
     let (holdings, names) = gather_holdings(&app, &state).await;
 
@@ -165,7 +222,9 @@ async fn get_positions(
     // Positions only need spot + FX; reuse the same lookback so parquet/synthetic
     // sources have a valid window to source the latest close from.
     let lookback = ptf_engine::MonteCarloConfig::default_var().lookback_days;
-    let pd = app.prices.build(&holdings, portfolio.base_currency, as_of, lookback)?;
+    let pd = app
+        .prices
+        .build(&holdings, portfolio.base_currency, as_of, lookback)?;
     let payload = positions_view::build(&portfolio, &state, &holdings, &names, &pd, as_of)?;
     Ok(Json(payload))
 }
@@ -179,18 +238,21 @@ struct PerfQuery {
 }
 
 async fn get_performance(
+    user: SessionUser,
     State(app): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<PerfQuery>,
 ) -> Result<Json<PerformancePayload>, ApiError> {
     let pid = parse_id(&id)?;
-    let portfolio = app.portfolios.get(pid).await?;
+    let portfolio = owned_portfolio(&app, user.0.id, pid).await?;
     let state = fold_state(&app, &portfolio).await?;
     let (holdings, _names) = gather_holdings(&app, &state).await;
 
     let as_of = Utc::now().date_naive();
     let lookback = ptf_engine::MonteCarloConfig::default_var().lookback_days;
-    let pd = app.prices.build(&holdings, portfolio.base_currency, as_of, lookback)?;
+    let pd = app
+        .prices
+        .build(&holdings, portfolio.base_currency, as_of, lookback)?;
 
     // Benchmark is best-effort: if it can't be fetched/priced we still return the
     // self-contained ratios, just without the `relative` block.
@@ -198,14 +260,27 @@ async fn get_performance(
         .benchmark
         .unwrap_or_else(|| DEFAULT_BENCHMARK.to_string())
         .to_uppercase();
-    let benchmark = benchmark_series(&app, portfolio.base_currency, as_of, lookback, &bench_symbol)
-        .await
-        .ok()
-        .flatten();
+    let benchmark = benchmark_series(
+        &app,
+        portfolio.base_currency,
+        as_of,
+        lookback,
+        &bench_symbol,
+    )
+    .await
+    .ok()
+    .flatten();
 
     let rf = q.rf.unwrap_or(0.0);
-    let payload =
-        perf_view::build(&portfolio, &state, &pd, as_of, lookback, rf, benchmark.as_ref())?;
+    let payload = perf_view::build(
+        &portfolio,
+        &state,
+        &pd,
+        as_of,
+        lookback,
+        rf,
+        benchmark.as_ref(),
+    )?;
     Ok(Json(payload))
 }
 

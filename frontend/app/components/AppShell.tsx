@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import type { CSSProperties } from "react";
+import { useRouter } from "next/navigation";
 import {
   Select,
   SelectContent,
@@ -17,6 +18,11 @@ import {
 import RiskDashboard from "./RiskDashboard";
 import PositionsPage from "./PositionsPage";
 import PerformancePage from "./PerformancePage";
+
+interface SessionUser {
+  id: string;
+  email: string;
+}
 
 type Page = "positions" | "risk" | "performance";
 
@@ -34,6 +40,8 @@ const NAV: NavItem[] = [
 ];
 
 export default function AppShell() {
+  const router = useRouter();
+  const [user, setUser] = useState<SessionUser | null>(null);
   const [portfolios, setPortfolios] = useState<PortfolioSummary[] | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [page, setPage] = useState<Page>("positions");
@@ -43,17 +51,40 @@ export default function AppShell() {
 
   const loadPortfolios = useCallback(() => {
     return fetch("/api/portfolios", { cache: "no-store" })
-      .then((r) => (r.ok ? r.json() : []))
+      .then((r) => {
+        // Expired/invalid session mid-use → back to the login page.
+        if (r.status === 401) {
+          router.replace("/login");
+          return [];
+        }
+        return r.ok ? r.json() : [];
+      })
       .then((list: PortfolioSummary[]) => {
         setPortfolios(list);
         setSelectedId((cur) => cur ?? list[0]?.id ?? null);
       })
       .catch(() => setPortfolios([]));
-  }, []);
+  }, [router]);
 
+  // Session probe first: only load the workspace once the user is known.
   useEffect(() => {
-    void loadPortfolios();
-  }, [loadPortfolios]);
+    fetch("/api/auth/me", { cache: "no-store" })
+      .then(async (r) => {
+        if (r.status === 401) {
+          router.replace("/login");
+          return;
+        }
+        if (!r.ok) throw new Error(`me failed: ${r.status}`);
+        setUser(await r.json());
+        void loadPortfolios();
+      })
+      .catch(() => setPortfolios([]));
+  }, [loadPortfolios, router]);
+
+  async function logout() {
+    await fetch("/api/auth/logout", { method: "POST" }).catch(() => {});
+    router.replace("/login");
+  }
 
   const selected = portfolios?.find((p) => p.id === selectedId) ?? null;
 
@@ -203,6 +234,40 @@ export default function AppShell() {
             >
               ＋ New
             </Button>
+            {user && (
+              <>
+                <span
+                  className="mono"
+                  title={user.email}
+                  style={{
+                    fontSize: 11,
+                    color: "#6b7280",
+                    maxWidth: 180,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {user.email}
+                </span>
+                <Button
+                  onClick={() => void logout()}
+                  variant="ghost"
+                  title="Log out"
+                  className="h-auto"
+                  style={{
+                    padding: "6px 11px",
+                    borderRadius: 9,
+                    background: "#14161d",
+                    border: "1px solid rgba(255,255,255,.07)",
+                    color: "#9aa1b2",
+                    fontSize: 13,
+                  }}
+                >
+                  Log out
+                </Button>
+              </>
+            )}
           </div>
         </div>
 

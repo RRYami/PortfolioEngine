@@ -2,7 +2,7 @@
 
 ## Project
 Portfolio analytics engine — domain layer in Rust.
-Current focus: **Postgres persistence implemented** — TimescaleDB in Docker, `Pg*Repository` trait implementations, API wired via `DATABASE_URL`. Next: snapshot caching / performance work.
+Current focus: **Users + authentication implemented** — argon2id passwords, server-side sessions (Postgres), per-user portfolio ownership, login/register UI. Next: snapshot caching / performance work.
 
 ## Tech Stack
 - **Language**: Rust stable, edition 2024
@@ -16,6 +16,7 @@ Current focus: **Postgres persistence implemented** — TimescaleDB in Docker, `
 - **Persistence**: `sqlx` with Postgres + TimescaleDB (`timescale/timescaledb:2.17.2-pg16`), no ORM. Embedded migrations via `sqlx::migrate!()`. `sqlx-cli` for migration authoring. Runtime-checked queries (no `query!` macros, no `.sqlx` offline data).
 - **Async traits**: `async-trait` for repository contracts
 - **Web API**: `axum` + `tower-http` for the HTTP service (`crates/api/`); `arrow`/`parquet` to read the price snapshot
+- **Auth**: `axum-login` 0.18 + `tower-sessions` 0.14 + `tower-sessions-sqlx-store` 0.15 (keep this version set in sync — both target tower-sessions 0.14). `password-auth` (argon2id) for hashing. `tower-governor` 0.8 for auth rate limiting (crate name is `tower_governor`).
 
 ## Build & Test
 ```bash
@@ -103,6 +104,15 @@ make test       # cargo test --workspace
 - DB tests use a **fresh small pool per test** (`test_util::test_pool`), never a shared static pool: pooled connections created on a dropped tokio runtime become zombies (`PoolTimedOut`). Tests skip gracefully when the DB is unreachable.
 - DB tests run against a dedicated **`ptf_engine_test`** database (auto-created on first run; override with `TEST_DATABASE_URL`) so fixtures never pollute the dev database or dashboard.
 
+### Authentication and ownership
+- **Users own portfolios**: `Portfolio.user_id` (engine `UserId` newtype) is set at creation from the session; `PortfolioRepository::list(user_id)` returns only the owner's rows. Ownership transfer is not supported (UPDATE never touches `user_id`).
+- **Auth model**: server-side sessions via `axum-login` + `tower-sessions`. Session data lives in the `tower_sessions.session` Postgres table (store migrates itself on boot; `MemoryStore` when running without `DATABASE_URL`). Cookie: `ptf_session`, HttpOnly, SameSite=Lax, Secure via `PTF_SECURE_COOKIES=1`, 7-day idle expiry. `login` regenerates the session id; `logout` destroys the session server-side.
+- **Passwords**: argon2id via `password-auth`; policy is NIST 800-63B length-only (8–128 chars). The engine `User` type deliberately has **no serde derive** — the API returns a `UserSummary` DTO; hashes never serialize.
+- **Auth routes** (`crates/api/src/auth.rs`): `POST /api/auth/register` (auto-login; `PTF_DISABLE_REGISTRATION=1` → 403), `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me`. Login errors are generic ("invalid email or password") — no user enumeration.
+- **Authorization**: the `SessionUser` extractor 401s unauthenticated requests; every portfolio-scoped handler loads via `owned_portfolio()` which returns **404** for missing *or* foreign-owned portfolios (no ID enumeration).
+- **Rate limiting**: `tower-governor` per-IP (5/min) on `/api/auth/login` + `/api/auth/register` only. Requires `ConnectInfo` — `main.rs` serves `into_make_service_with_connect_info`; tests insert `ConnectInfo` into request extensions.
+- **Email normalization**: `User::new` lowercases the email; uniqueness and `by_email` are case-insensitive.
+
 ### Serialization
 - `serde` is an optional feature. When enabled:
   - `Currency` serializes as `"USD"` (custom impl, not derived from `[u8; 3]`)
@@ -142,7 +152,9 @@ make test       # cargo test --workspace
 11. `Portfolio` (metadata) and `PortfolioState` (derived) are separate types. Metadata is persisted; state is always re-derived from transactions.
 
 ## Deferred (do not implement unprompted)
-- Authentication / multi-tenancy
+- Email verification and password reset (needs SMTP)
+- MFA/TOTP, passkeys, OAuth/OIDC
+- Account deletion, portfolio sharing between users, admin roles
 - Borrow fees and margin interest accounting
 - Options, futures, derivatives
 - Snapshot caching for performance
@@ -171,18 +183,20 @@ ptf_engine/
         lot.rs             # Lot struct with sequence, side, basis
         lot_method.rs      # LotMethod, LotSide, LotSelection, LotSelectionEntry
         money.rs           # Money { amount, currency }
-        portfolio.rs       # Portfolio metadata (id, name, base_currency, lot_method)
+        portfolio.rs       # Portfolio metadata (id, user_id, name, base_currency, lot_method)
         portfolio_config.rs# PortfolioConfig { lot_method, base_currency }
         portfolio_state.rs # PortfolioState { positions, cash, realized_pnl, next_lot_sequence }
         position.rs        # Position { instrument, currency, lots, realized_pnl }
         price.rs           # PriceProvider trait, PriceError, StaticPriceProvider
         repository/        # storage contracts and in-memory impls
         risk.rs            # MonteCarloConfig, VaRReport, AssetRisk, compute_var()
+        user.rs            # User (id, email, password_hash) — no serde (credential material)
           mod.rs
           error.rs         # RepoError
           portfolio.rs     # PortfolioRepository trait
           transaction.rs   # TransactionRepository trait
           instrument.rs    # InstrumentRepository trait
+          user.rs          # UserRepository trait
           memory.rs        # InMemory*Repository impls
         transaction.rs     # Transaction, TransactionKind, CorporateAction + constructors
         valuation.rs       # ValuationError, PortfolioState::total_value()
@@ -196,6 +210,7 @@ ptf_engine/
       src/
         main.rs            # server bootstrap + price-source selection
         handlers.rs        # routes: portfolios, holdings, risk
+        auth.rs            # axum-login backend, auth routes, SessionUser extractor
         risk_view.rs       # VaRReport + PortfolioState → dashboard JSON
         charts.rs          # P&L distribution, drawdown, historical-VaR series
         price_source.rs    # SyntheticPriceSource + ParquetPriceSource
@@ -207,22 +222,24 @@ ptf_engine/
         portfolio.rs      # PgPortfolioRepository
         transaction.rs    # PgTransactionRepository (hypertable)
         instrument.rs     # PgInstrumentRepository
+        user.rs           # PgUserRepository
         test_util.rs      # DB-test pool helper (skips when DB is down)
       migrations/
         0001_initial.sql  # schema + TimescaleDB hypertable
+        0002_users.sql    # users table + portfolios.user_id FK
   services/
     prices/              # Python price/FX service (yfinance → DuckDB → Parquet)
   frontend/              # Next.js dashboard (risk desk UI)
 ```
 
 ## Test Counts
-- **161 engine unit tests** (inline `#[cfg(test)]` across all source files, including 16 repository memory tests and 4 risk tests)
-- **23 persistence tests** (2 migration/hypertable smoke tests + 21 `Pg*Repository` tests; need `make db-up`, skip gracefully without it)
-- **6 API unit tests** (inline in `crates/api/`)
+- **167 engine unit tests** (inline `#[cfg(test)]` across all source files, including 21 repository memory tests and 4 risk tests)
+- **28 persistence tests** (2 migration/hypertable smoke tests + 26 `Pg*Repository` tests; need `make db-up`, skip gracefully without it)
+- **15 API tests** (2 auth validation unit tests + 7 auth stack integration tests via `tower::oneshot` + 6 others)
 - **11 fold property tests** (`tests/fold_properties.rs`)
 - **5 valuation property tests** (`tests/valuation_properties.rs`)
-- **35 serde round-trip tests** (`tests/serde_roundtrip.rs`, `serde` feature)
-- **Total: 241 tests with all features, all passing**
+- **36 serde round-trip tests** (`tests/serde_roundtrip.rs`, `serde` feature)
+- **Total: 262 tests with all features, all passing**
 
 ## How to Extend
 1. Add new error variants to `DomainError` or `RepoError` if needed.

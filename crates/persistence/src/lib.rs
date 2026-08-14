@@ -11,10 +11,12 @@ pub mod portfolio;
 #[cfg(test)]
 mod test_util;
 pub mod transaction;
+pub mod user;
 
 pub use instrument::PgInstrumentRepository;
 pub use portfolio::PgPortfolioRepository;
 pub use transaction::PgTransactionRepository;
+pub use user::PgUserRepository;
 
 pub const MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -108,6 +110,7 @@ mod tests {
         assert!(table_names.contains(&"portfolios".to_string()));
         assert!(table_names.contains(&"instruments".to_string()));
         assert!(table_names.contains(&"transactions".to_string()));
+        assert!(table_names.contains(&"users".to_string()));
     }
 
     #[tokio::test]

@@ -18,12 +18,14 @@ Services (see `docker-compose.yml`): `frontend` (:3000) → `api` (:8080) →
 `prices` (:8001), plus `postgres` (:5433, TimescaleDB). The `api` and `prices`
 containers share the `pricedata` volume — `prices` writes the Parquet snapshot,
 `api` reads it; they also talk over the network for ensure-on-add. Portfolios,
-instruments, and transactions are stored durably in Postgres (the `pgdata`
-volume); the API applies embedded migrations on boot. Create a portfolio
-in the UI, add holdings (real prices are fetched live on first use), and the
-Rust engine computes the analytics. The dashboard has two pages, switched from
-the sidebar: **Positions** (a sortable/filterable/paginated holdings table with
-per-lot drill-in) and **Risk** (VaR/ES, component VaR, and the chart series).
+instruments, transactions, users, and sessions are stored durably in Postgres
+(the `pgdata` volume); the API applies embedded migrations on boot. The app
+requires an account: register in the UI (first user or anyone, unless
+`PTF_DISABLE_REGISTRATION=1`), then create portfolios and add holdings (real
+prices are fetched live on first use). The dashboard has three pages, switched
+from the sidebar: **Positions** (a sortable/filterable/paginated holdings table
+with per-lot drill-in), **Risk** (VaR/ES, component VaR, and the chart series),
+and **Performance** (risk-adjusted ratios vs a benchmark).
 
 For frontend development with hot reload, run the backend in Docker
 (`docker compose up -d prices api`) and the dashboard locally
@@ -62,10 +64,11 @@ Implemented:
 - **Risk analytics**: Monte-Carlo VaR / CVaR with Cholesky-correlated sampling, configurable confidence levels / horizons / lookback, and per-asset component-VaR decomposition
 - **serde feature**: optional `Serialize`/`Deserialize` on all domain types for JSON persistence and API serialization
 - **Repository traits**: async `PortfolioRepository`, `TransactionRepository`, `InstrumentRepository` with thread-safe in-memory implementations
-- **Postgres persistence crate** (`crates/persistence/`): `sqlx`-based `Pg*Repository` implementations of the three repository traits, embedded migrations, and connection pool helpers. `transactions` is a TimescaleDB hypertable partitioned by `trade_date`; portfolios and instruments stay plain reference tables.
+- **Users + authentication**: argon2id password hashing, server-side sessions (Postgres-backed, HttpOnly cookie), per-user portfolio ownership with 404-on-foreign isolation, login/register/logout endpoints, per-IP rate limiting on auth routes, and a login/register UI in the dashboard. Registration can be disabled with `PTF_DISABLE_REGISTRATION=1`.
+- **Postgres persistence crate** (`crates/persistence/`): `sqlx`-based `Pg*Repository` implementations of the four repository traits, embedded migrations, and connection pool helpers. `transactions` is a TimescaleDB hypertable partitioned by `trade_date`; portfolios, instruments, and users stay plain reference tables.
 - **Analytics API** (`crates/api/`): Axum HTTP service over the engine — create portfolios, add holdings, fetch a positions view (holdings valued at spot with their tax lots) and a risk payload (VaR/ES, component VaR, positions, and chart series) computed by `compute_var`
 - **Price service + dashboard**: Python `services/prices/` (yfinance → DuckDB → Parquet) feeding the API, and a Next.js `frontend/` dashboard; the whole stack runs via Docker Compose
-- 190 unit tests (including 23 Postgres repository tests) + 16 property tests + 35 serde round-trip tests, all passing
+- 210 unit tests (including 28 Postgres repository tests and 9 auth tests) + 16 property tests + 36 serde round-trip tests, all passing
 
 Deferred:
 - Snapshot caching for performance
@@ -81,6 +84,9 @@ cargo build --workspace
 # set DATABASE_URL for Postgres and PTF_PRICES=parquet for the price service)
 cargo run -p ptf-api
 DATABASE_URL=postgres://ptf:ptf@localhost:5433/ptf_engine cargo run -p ptf-api
+
+# Auth env flags: PTF_DISABLE_REGISTRATION=1 (close sign-up),
+# PTF_SECURE_COOKIES=1 (Secure cookie flag — enable behind TLS)
 
 # Run all tests (domain only, no serde, no in-memory repo)
 cargo test --workspace
@@ -149,6 +155,7 @@ ptf_engine/
       src/
         main.rs            # server bootstrap + price-source selection (synthetic / parquet)
         handlers.rs        # routes: portfolios, holdings, positions, risk
+        auth.rs            # session auth: register/login/logout/me, axum-login backend
         risk_view.rs       # maps VaRReport + PortfolioState → dashboard JSON
         positions_view.rs  # lightweight positions + tax-lot view (no Monte-Carlo)
         charts.rs          # P&L distribution, drawdown, historical-VaR series
@@ -161,9 +168,11 @@ ptf_engine/
         portfolio.rs       # PgPortfolioRepository
         transaction.rs     # PgTransactionRepository (hypertable)
         instrument.rs      # PgInstrumentRepository
+        user.rs            # PgUserRepository
         test_util.rs       # DB-test pool helper (skips when DB is down)
       migrations/
         0001_initial.sql   # schema + TimescaleDB hypertable
+        0002_users.sql     # users table + portfolios.user_id FK
   services/
     prices/               # Python price/FX service (yfinance → DuckDB → Parquet)
   frontend/               # Next.js dashboard — Positions + Risk pages with a shared sidebar shell

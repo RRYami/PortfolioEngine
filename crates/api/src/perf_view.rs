@@ -251,7 +251,11 @@ fn kurtosis(rets: &[f64]) -> f64 {
 
 fn calmar(rets: &[f64], equity: &[f64]) -> f64 {
     let mdd = max_drawdown_pct(equity) / 100.0;
-    if mdd == 0.0 { 0.0 } else { ann_return(rets) / mdd.abs() }
+    if mdd == 0.0 {
+        0.0
+    } else {
+        ann_return(rets) / mdd.abs()
+    }
 }
 
 fn ratio_set(equity: &[f64], rets: &[f64], rf_daily: f64) -> RatioSet {
@@ -314,7 +318,13 @@ fn horizons(equity: &[f64], rets: &[f64], rf_daily: f64) -> Vec<HorizonRow> {
     out
 }
 
-fn horizon_row(label: &str, days: usize, equity: &[f64], rets: &[f64], rf_daily: f64) -> HorizonRow {
+fn horizon_row(
+    label: &str,
+    days: usize,
+    equity: &[f64],
+    rets: &[f64],
+    rf_daily: f64,
+) -> HorizonRow {
     HorizonRow {
         label: label.to_string(),
         days,
@@ -477,7 +487,10 @@ mod tests {
         let rets = returns(&eq);
         let values: BTreeMap<NaiveDate, f64> =
             dates.iter().zip(&eq).map(|(d, &v)| (*d, v)).collect();
-        let bench = BenchmarkSeries { symbol: "BM".into(), values };
+        let bench = BenchmarkSeries {
+            symbol: "BM".into(),
+            values,
+        };
         let rel = relative_stats(&dates, &rets, 0.0, &bench).unwrap();
         assert!((rel.beta - 1.0).abs() < 1e-6);
         assert!((rel.correlation - 1.0).abs() < 1e-6);

@@ -7,7 +7,7 @@ use sqlx::types::Json;
 use uuid::Uuid;
 
 use ptf_engine::currency::Currency;
-use ptf_engine::ids::PortfolioId;
+use ptf_engine::ids::{PortfolioId, UserId};
 use ptf_engine::lot_method::LotMethod;
 use ptf_engine::portfolio::Portfolio;
 use ptf_engine::repository::error::RepoError;
@@ -16,6 +16,7 @@ use ptf_engine::repository::portfolio::PortfolioRepository;
 use crate::error::{map_domain, map_sqlx};
 
 type PortfolioRow = (
+    Uuid,
     Uuid,
     String,
     String,
@@ -26,9 +27,19 @@ type PortfolioRow = (
 );
 
 fn row_to_portfolio(row: PortfolioRow) -> Result<Portfolio, RepoError> {
-    let (id, name, base_currency, Json(lot_method), inception_date, created_at, updated_at) = row;
+    let (
+        id,
+        user_id,
+        name,
+        base_currency,
+        Json(lot_method),
+        inception_date,
+        created_at,
+        updated_at,
+    ) = row;
     Ok(Portfolio {
         id: PortfolioId(id),
+        user_id: UserId(user_id),
         name,
         base_currency: Currency::try_from(base_currency.as_str()).map_err(|e| map_domain(&e))?,
         lot_method,
@@ -52,13 +63,16 @@ impl PgPortfolioRepository {
 
 #[async_trait]
 impl PortfolioRepository for PgPortfolioRepository {
+    /// Creates a portfolio. The owner must exist: a foreign-key violation
+    /// surfaces as [`RepoError::NotFound`].
     async fn create(&self, portfolio: &Portfolio) -> Result<(), RepoError> {
         sqlx::query(
             "INSERT INTO portfolios
-                 (id, name, base_currency, lot_method, inception_date, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                 (id, user_id, name, base_currency, lot_method, inception_date, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(portfolio.id.0)
+        .bind(portfolio.user_id.0)
         .bind(&portfolio.name)
         .bind(portfolio.base_currency.as_str())
         .bind(Json(portfolio.lot_method))
@@ -73,7 +87,7 @@ impl PortfolioRepository for PgPortfolioRepository {
 
     async fn get(&self, id: PortfolioId) -> Result<Portfolio, RepoError> {
         let row = sqlx::query_as::<_, PortfolioRow>(
-            "SELECT id, name, base_currency, lot_method, inception_date, created_at, updated_at
+            "SELECT id, user_id, name, base_currency, lot_method, inception_date, created_at, updated_at
              FROM portfolios WHERE id = $1",
         )
         .bind(id.0)
@@ -83,11 +97,12 @@ impl PortfolioRepository for PgPortfolioRepository {
         row_to_portfolio(row)
     }
 
-    async fn list(&self) -> Result<Vec<Portfolio>, RepoError> {
+    async fn list(&self, user_id: UserId) -> Result<Vec<Portfolio>, RepoError> {
         let rows = sqlx::query_as::<_, PortfolioRow>(
-            "SELECT id, name, base_currency, lot_method, inception_date, created_at, updated_at
-             FROM portfolios ORDER BY created_at, id",
+            "SELECT id, user_id, name, base_currency, lot_method, inception_date, created_at, updated_at
+             FROM portfolios WHERE user_id = $1 ORDER BY created_at, id",
         )
+        .bind(user_id.0)
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -132,12 +147,17 @@ impl PortfolioRepository for PgPortfolioRepository {
 
 #[cfg(test)]
 mod tests {
+    use ptf_engine::repository::user::UserRepository;
+    use ptf_engine::user::User;
+
     use super::*;
     use crate::test_util::test_pool;
+    use crate::user::PgUserRepository;
 
-    fn portfolio(name: &str) -> Portfolio {
+    fn portfolio(user_id: UserId, name: &str) -> Portfolio {
         Portfolio::new(
             PortfolioId::new(),
+            user_id,
             name,
             Currency::USD,
             LotMethod::Fifo,
@@ -145,13 +165,27 @@ mod tests {
         )
     }
 
+    /// Creates a fresh user (portfolios reference one via FK).
+    async fn new_user(pool: &PgPool) -> UserId {
+        let repo = PgUserRepository::new(pool.clone());
+        let u = User::new(
+            UserId::new(),
+            format!("{}@example.com", Uuid::new_v4().simple()),
+            "hash",
+            NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+        );
+        repo.create(&u).await.unwrap();
+        u.id
+    }
+
     #[tokio::test]
     async fn portfolio_create_and_get() {
         let Some(pool) = test_pool().await else {
             return;
         };
+        let uid = new_user(&pool).await;
         let repo = PgPortfolioRepository::new(pool);
-        let p = portfolio("test-portfolio");
+        let p = portfolio(uid, "test-portfolio");
 
         repo.create(&p).await.unwrap();
         let got = repo.get(p.id).await.unwrap();
@@ -159,12 +193,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portfolio_create_duplicate_errors() {
+    async fn portfolio_create_missing_user_returns_not_found() {
         let Some(pool) = test_pool().await else {
             return;
         };
         let repo = PgPortfolioRepository::new(pool);
-        let p = portfolio("dupe");
+        let p = portfolio(UserId::new(), "orphan");
+
+        let result = repo.create(&p).await;
+        assert!(matches!(result, Err(RepoError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn portfolio_create_duplicate_errors() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let uid = new_user(&pool).await;
+        let repo = PgPortfolioRepository::new(pool);
+        let p = portfolio(uid, "dupe");
 
         repo.create(&p).await.unwrap();
         let result = repo.create(&p).await;
@@ -182,21 +229,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portfolio_list_contains_created() {
+    async fn portfolio_list_returns_only_owner_portfolios() {
         let Some(pool) = test_pool().await else {
             return;
         };
+        let alice = new_user(&pool).await;
+        let bob = new_user(&pool).await;
         let repo = PgPortfolioRepository::new(pool);
-        // Unique names: other tests may insert into the shared table in parallel.
-        let p1 = portfolio(&format!("alpha-{}", Uuid::new_v4()));
-        let p2 = portfolio(&format!("beta-{}", Uuid::new_v4()));
+        let p1 = portfolio(alice, &format!("alpha-{}", Uuid::new_v4()));
+        let p2 = portfolio(alice, &format!("beta-{}", Uuid::new_v4()));
+        let p3 = portfolio(bob, &format!("gamma-{}", Uuid::new_v4()));
 
         repo.create(&p1).await.unwrap();
         repo.create(&p2).await.unwrap();
+        repo.create(&p3).await.unwrap();
 
-        let list = repo.list().await.unwrap();
-        assert!(list.contains(&p1));
-        assert!(list.contains(&p2));
+        let alices = repo.list(alice).await.unwrap();
+        assert_eq!(alices.len(), 2);
+        assert!(alices.contains(&p1));
+        assert!(alices.contains(&p2));
+
+        let bobs = repo.list(bob).await.unwrap();
+        assert_eq!(bobs, vec![p3]);
     }
 
     #[tokio::test]
@@ -204,8 +258,9 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
+        let uid = new_user(&pool).await;
         let repo = PgPortfolioRepository::new(pool);
-        let mut p = portfolio("original");
+        let mut p = portfolio(uid, "original");
         repo.create(&p).await.unwrap();
 
         p.name = "updated".to_string();
@@ -222,7 +277,7 @@ mod tests {
             return;
         };
         let repo = PgPortfolioRepository::new(pool);
-        let p = portfolio("orphan");
+        let p = portfolio(UserId::new(), "orphan");
         let result = repo.update(&p).await;
         assert!(matches!(result, Err(RepoError::NotFound)));
     }
@@ -232,8 +287,9 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
+        let uid = new_user(&pool).await;
         let repo = PgPortfolioRepository::new(pool);
-        let p = portfolio("to-delete");
+        let p = portfolio(uid, "to-delete");
         repo.create(&p).await.unwrap();
 
         repo.delete(p.id).await.unwrap();

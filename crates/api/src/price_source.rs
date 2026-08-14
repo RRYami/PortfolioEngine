@@ -237,9 +237,7 @@ fn col_f64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Float64Array, A
 }
 
 fn dec(x: f64) -> Decimal {
-    Decimal::from_f64_retain(x)
-        .unwrap_or_default()
-        .round_dp(6)
+    Decimal::from_f64_retain(x).unwrap_or_default().round_dp(6)
 }
 
 fn symbol_seed(symbol: &str) -> u32 {

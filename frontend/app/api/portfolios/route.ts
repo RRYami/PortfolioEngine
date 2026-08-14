@@ -1,15 +1,12 @@
-import { PTF_API_URL, passthrough } from "@/app/lib/apiBase";
+import { PTF_API_URL, forward } from "@/app/lib/apiBase";
 
 // GET  /api/portfolios       → list portfolios
 // POST /api/portfolios       → create a portfolio
-// Thin same-origin proxies to the Rust engine.
+// Thin same-origin proxies to the Rust engine (session cookie forwarded).
 
-export async function GET() {
+export async function GET(req: Request) {
   try {
-    const r = await fetch(`${PTF_API_URL}/api/portfolios`, {
-      cache: "no-store",
-    });
-    return passthrough(r.status, await r.text());
+    return await forward(req, `${PTF_API_URL}/api/portfolios`);
   } catch {
     return Response.json([], { status: 200 });
   }
@@ -17,10 +14,8 @@ export async function GET() {
 
 export async function POST(req: Request) {
   const body = await req.text();
-  const r = await fetch(`${PTF_API_URL}/api/portfolios`, {
+  return forward(req, `${PTF_API_URL}/api/portfolios`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
     body,
   });
-  return passthrough(r.status, await r.text());
 }

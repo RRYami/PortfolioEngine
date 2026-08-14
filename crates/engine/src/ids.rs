@@ -22,6 +22,11 @@ pub struct LotId(pub Uuid);
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TransactionId(pub Uuid);
 
+/// Newtype wrapper around [`Uuid`] for type-safe user identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct UserId(pub Uuid);
+
 impl InstrumentId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
@@ -41,6 +46,12 @@ impl LotId {
 }
 
 impl TransactionId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl UserId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -70,6 +81,12 @@ impl Default for TransactionId {
     }
 }
 
+impl Default for UserId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl fmt::Display for InstrumentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
@@ -89,6 +106,12 @@ impl fmt::Display for LotId {
 }
 
 impl fmt::Display for TransactionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for UserId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }

@@ -1,11 +1,12 @@
 //! HTTP API for the portfolio analytics engine.
 //!
-//! Thin Axum layer over `ptf-engine`: portfolios + holdings CRUD (Postgres
-//! when `DATABASE_URL` is set, in-memory otherwise) and a `/risk` endpoint
-//! that folds transactions into a `PortfolioState`, runs `compute_var`, and
-//! shapes the result into the dashboard's JSON contract. Market data is
-//! supplied by a pluggable [`PriceSource`].
+//! Thin Axum layer over `ptf-engine`: session-authenticated portfolios +
+//! holdings CRUD (Postgres when `DATABASE_URL` is set, in-memory otherwise)
+//! and a `/risk` endpoint that folds transactions into a `PortfolioState`,
+//! runs `compute_var`, and shapes the result into the dashboard's JSON
+//! contract. Market data is supplied by a pluggable [`PriceSource`].
 
+mod auth;
 mod charts;
 mod dto;
 mod equity;
@@ -22,14 +23,56 @@ use std::sync::Arc;
 
 use ptf_engine::{
     InMemoryInstrumentRepository, InMemoryPortfolioRepository, InMemoryTransactionRepository,
-    InstrumentRepository, PortfolioRepository, TransactionRepository,
+    InMemoryUserRepository, InstrumentRepository, PortfolioRepository, TransactionRepository,
+    UserRepository,
 };
-use ptf_persistence::{PgInstrumentRepository, PgPortfolioRepository, PgTransactionRepository};
+use ptf_persistence::{
+    PgInstrumentRepository, PgPortfolioRepository, PgTransactionRepository, PgUserRepository,
+};
+use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+use tower_sessions::MemoryStore;
+use tower_sessions_sqlx_store::PostgresStore;
 
 use crate::price_source::{ParquetPriceSource, PriceSource, SyntheticPriceSource};
 use crate::state::AppState;
+
+/// Repository set plus the pool (when Postgres-backed) for the session store.
+struct Storage {
+    portfolios: Arc<dyn PortfolioRepository>,
+    transactions: Arc<dyn TransactionRepository>,
+    instruments: Arc<dyn InstrumentRepository>,
+    users: Arc<dyn UserRepository>,
+    pool: Option<PgPool>,
+}
+
+/// Build the repositories from env. When `DATABASE_URL` is set the API runs
+/// on Postgres (embedded migrations are applied on boot); otherwise it falls
+/// back to throwaway in-memory repositories.
+async fn storage() -> Storage {
+    if let Ok(url) = std::env::var("DATABASE_URL") {
+        let pool = ptf_persistence::create_pool(&url)
+            .await
+            .expect("DATABASE_URL is set but the database is unreachable or migrations failed");
+        tracing::info!("storage: postgres (migrated)");
+        return Storage {
+            portfolios: Arc::new(PgPortfolioRepository::new(pool.clone())),
+            transactions: Arc::new(PgTransactionRepository::new(pool.clone())),
+            instruments: Arc::new(PgInstrumentRepository::new(pool.clone())),
+            users: Arc::new(PgUserRepository::new(pool.clone())),
+            pool: Some(pool),
+        };
+    }
+    tracing::info!("storage: in-memory (set DATABASE_URL for postgres)");
+    Storage {
+        portfolios: Arc::new(InMemoryPortfolioRepository::new()),
+        transactions: Arc::new(InMemoryTransactionRepository::new()),
+        instruments: Arc::new(InMemoryInstrumentRepository::new()),
+        users: Arc::new(InMemoryUserRepository::new()),
+        pool: None,
+    }
+}
 
 /// Build the price source from env. `PTF_PRICES=parquet` reads the Python
 /// service's Parquet export (with ensure-on-add via `PRICES_URL`); otherwise a
@@ -40,8 +83,7 @@ fn price_source() -> (Arc<dyn PriceSource>, Option<String>) {
             .unwrap_or_else(|_| "services/prices/data/prices.parquet".into());
         let fx = std::env::var("FX_PARQUET")
             .unwrap_or_else(|_| "services/prices/data/fx.parquet".into());
-        let url = std::env::var("PRICES_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8001".into());
+        let url = std::env::var("PRICES_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".into());
         tracing::info!("prices: parquet ({prices}), ensure via {url}");
         (Arc::new(ParquetPriceSource::new(prices, fx)), Some(url))
     } else {
@@ -50,31 +92,8 @@ fn price_source() -> (Arc<dyn PriceSource>, Option<String>) {
     }
 }
 
-/// Build the repositories from env. When `DATABASE_URL` is set the API runs
-/// on Postgres (embedded migrations are applied on boot); otherwise it falls
-/// back to throwaway in-memory repositories.
-async fn repositories() -> (
-    Arc<dyn PortfolioRepository>,
-    Arc<dyn TransactionRepository>,
-    Arc<dyn InstrumentRepository>,
-) {
-    if let Ok(url) = std::env::var("DATABASE_URL") {
-        let pool = ptf_persistence::create_pool(&url)
-            .await
-            .expect("DATABASE_URL is set but the database is unreachable or migrations failed");
-        tracing::info!("storage: postgres (migrated)");
-        return (
-            Arc::new(PgPortfolioRepository::new(pool.clone())),
-            Arc::new(PgTransactionRepository::new(pool.clone())),
-            Arc::new(PgInstrumentRepository::new(pool)),
-        );
-    }
-    tracing::info!("storage: in-memory (set DATABASE_URL for postgres)");
-    (
-        Arc::new(InMemoryPortfolioRepository::new()),
-        Arc::new(InMemoryTransactionRepository::new()),
-        Arc::new(InMemoryInstrumentRepository::new()),
-    )
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 #[tokio::main]
@@ -86,10 +105,45 @@ async fn main() {
         )
         .init();
 
+    let storage = storage().await;
     let (prices, prices_url) = price_source();
-    let (portfolios, transactions, instruments) = repositories().await;
-    let state = AppState::new(portfolios, transactions, instruments, prices, prices_url);
-    let app = handlers::router(state)
+    let registration_open = !env_flag("PTF_DISABLE_REGISTRATION");
+    // Secure cookies need TLS; off by default for local HTTP dev.
+    let secure_cookies = env_flag("PTF_SECURE_COOKIES");
+    if !registration_open {
+        tracing::info!("registration disabled (PTF_DISABLE_REGISTRATION)");
+    }
+
+    let state = AppState::new(
+        storage.portfolios,
+        storage.transactions,
+        storage.instruments,
+        storage.users.clone(),
+        prices,
+        prices_url,
+        registration_open,
+    );
+    let backend = auth::Backend::new(storage.users);
+    let router = handlers::router(state);
+
+    // Both arms produce the same `Router` type; only the session store differs.
+    let app = if let Some(pool) = storage.pool {
+        let store = PostgresStore::new(pool);
+        store
+            .migrate()
+            .await
+            .expect("session store migration failed");
+        router.layer(auth::auth_layer(
+            backend,
+            auth::session_layer(store, secure_cookies),
+        ))
+    } else {
+        router.layer(auth::auth_layer(
+            backend,
+            auth::session_layer(MemoryStore::default(), secure_cookies),
+        ))
+    };
+    let app = app
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());
 
@@ -102,5 +156,11 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("bind listener");
-    axum::serve(listener, app).await.expect("server error");
+    // ConnectInfo provides the client IP for the auth rate limiter.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("server error");
 }
