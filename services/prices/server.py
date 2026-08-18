@@ -83,6 +83,28 @@ class EnsureReq(BaseModel):
     force: bool = False
 
 
+def _upsert(con, table: str, df: pd.DataFrame, keys: tuple[str, ...]) -> None:
+    """Replace-by-key in one set-based statement.
+
+    DuckDB is columnar: a row-by-row `INSERT OR REPLACE` against a primary key
+    probes the index per row and costs milliseconds *each* — ~8s for 2600 FX
+    rows. Deleting the incoming keys and inserting the frame in bulk does the
+    same job ~400x faster. `df` column order must match the table.
+    """
+    if df.empty:
+        return
+    key_expr = ", ".join(keys)
+    con.register("_incoming", df)
+    try:
+        con.execute(
+            f"DELETE FROM {table} WHERE ({key_expr}) "
+            f"IN (SELECT {key_expr} FROM _incoming)"
+        )
+        con.execute(f"INSERT INTO {table} SELECT * FROM _incoming")
+    finally:
+        con.unregister("_incoming")
+
+
 def _is_fresh(con, symbol: str) -> bool:
     row = con.execute(
         "SELECT max(date) FROM prices WHERE symbol = ?", [symbol]
@@ -109,7 +131,12 @@ def fetch_symbol(con, symbol: str, period: str, force: bool) -> dict:
     ]
     if not recs:
         raise ValueError(f"no usable closes for {symbol}")
-    con.executemany("INSERT OR REPLACE INTO prices VALUES (?, ?, ?)", recs)
+    _upsert(
+        con,
+        "prices",
+        pd.DataFrame(recs, columns=["symbol", "date", "close"]),
+        ("symbol", "date"),
+    )
 
     row = con.execute(
         "SELECT count(*), max(date) FROM prices WHERE symbol = ?", [symbol]
@@ -117,14 +144,35 @@ def fetch_symbol(con, symbol: str, period: str, force: bool) -> dict:
     return {"rows": row[0], "last": str(row[1]), "cached": False}
 
 
-def fetch_fx(con, period: str = FX_PERIOD) -> dict:
+def _fresh_currencies(con) -> set[str]:
+    """Currencies whose series already reaches (near) today.
+
+    FX had no freshness check while prices did, so every /ensure refetched and
+    rewrote a decade of rates — including the ensure-on-read the performance
+    page used to do on every request.
+    """
+    today = dt.date.today()
+    return {
+        ccy
+        for ccy, last in con.execute(
+            "SELECT ccy, max(date) FROM fx GROUP BY ccy"
+        ).fetchall()
+        if last is not None and (today - last).days <= 3
+    }
+
+
+def fetch_fx(con, period: str = FX_PERIOD, force: bool = False) -> dict:
     """Refresh the dated USD-per-unit series for every supported currency."""
     out: dict[str, dict | str] = {}
     dates: set[dt.date] = set()
+    fresh = set() if force else _fresh_currencies(con)
 
     for ccy, spec in FX_SYMBOLS.items():
         if spec is None:
             continue  # USD is filled in below, once the date span is known
+        if ccy in fresh:
+            out[ccy] = {"cached": True}
+            continue
         sym, invert = spec
         try:
             h = yf.Ticker(sym).history(period=period, interval="1d", auto_adjust=True)
@@ -140,7 +188,12 @@ def fetch_fx(con, period: str = FX_PERIOD) -> dict:
                 d = ts.date()
                 rows.append((ccy, d, (1.0 / close) if invert else close))
                 dates.add(d)
-            con.executemany("INSERT OR REPLACE INTO fx VALUES (?, ?, ?)", rows)
+            _upsert(
+                con,
+                "fx",
+                pd.DataFrame(rows, columns=["ccy", "date", "usd_per_unit"]),
+                ("ccy", "date"),
+            )
             out[ccy] = {
                 "rows": len(rows),
                 "first": str(rows[0][1]),
@@ -153,11 +206,18 @@ def fetch_fx(con, period: str = FX_PERIOD) -> dict:
     # USD is the pivot: 1.0 on every date any other currency quotes, so a
     # USD-denominated lot never misses a rate the others have.
     if dates:
-        con.executemany(
-            "INSERT OR REPLACE INTO fx VALUES (?, ?, ?)",
-            [("USD", d, 1.0) for d in sorted(dates)],
+        _upsert(
+            con,
+            "fx",
+            pd.DataFrame(
+                [("USD", d, 1.0) for d in sorted(dates)],
+                columns=["ccy", "date", "usd_per_unit"],
+            ),
+            ("ccy", "date"),
         )
         out["USD"] = {"rows": len(dates), "latest": 1.0}
+    elif "USD" in fresh:
+        out["USD"] = {"cached": True}
     return out
 
 
@@ -190,7 +250,7 @@ def ensure(req: EnsureReq) -> dict:
                 symbols[sym] = fetch_symbol(con, sym, req.period, req.force)
             except Exception as e:  # noqa: BLE001
                 symbols[sym] = {"error": str(e)}
-        fx = fetch_fx(con)
+        fx = fetch_fx(con, force=req.force)
         export(con)
     finally:
         con.close()

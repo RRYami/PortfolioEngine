@@ -359,9 +359,13 @@ async fn benchmark_series(
     lookback: u32,
     symbol: &str,
 ) -> Result<Option<BenchmarkSeries>, ApiError> {
-    // Ensure-on-read so the benchmark is available even if never held. Ignore
-    // failures — the caller degrades to no benchmark.
-    let _ = ensure_prices(app, symbol).await;
+    // Ensure-on-read so the benchmark is available even if never held — but
+    // rate-limited, because this is a GET: an unconditional ensure put a
+    // cross-service round trip (and a database write) on every page load.
+    // Ignore failures; the caller degrades to no benchmark.
+    if app.should_ensure(symbol) {
+        let _ = ensure_prices(app, symbol).await;
+    }
 
     let bid = InstrumentId::new();
     let holdings = vec![HeldInstrument {
