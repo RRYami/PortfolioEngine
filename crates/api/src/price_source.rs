@@ -32,7 +32,7 @@ pub struct HeldInstrument {
 /// calendar days ending at `as_of` (see [`ParquetPriceSource`]):
 ///
 /// - `fx` is keyed by those same remapped days, so it lines up with
-///   `historical` for equity-curve and VaR math.
+///   `historical` for equity-curve and `VaR` math.
 /// - `fx_trade_date` is keyed by real calendar dates, for converting a tax
 ///   lot's cost at the rate that actually applied on its trade date.
 ///
@@ -181,7 +181,18 @@ impl PriceSource for ParquetPriceSource {
 
         let base_series: &[(NaiveDate, f64)] = &fxmap[base.as_str()];
 
-        for c in &needed {
+        // Populate every currency the parquet knows, not just the ones held
+        // today: valuation also converts cash balances and realized P&L, which
+        // outlive the position that created them. A book that sold out of its
+        // only USD holding still has a USD realized-P&L entry to convert.
+        let mut available: Vec<Currency> = fxmap
+            .keys()
+            .filter_map(|c| Currency::try_from(c.as_str()).ok())
+            .collect();
+        available.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        available.dedup();
+
+        for c in &available {
             if *c == base {
                 continue; // identity, handled by the trait
             }

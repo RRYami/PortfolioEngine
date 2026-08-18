@@ -14,7 +14,7 @@ import {
   type SortingState,
 } from "@tanstack/react-table";
 import type { PositionDetail } from "@/app/lib/positionsTypes";
-import { ccySym, comp, MINUS, nf } from "@/app/lib/format";
+import { ccySym, comp, MINUS, nf, qty } from "@/app/lib/format";
 
 const GAIN = "var(--gain)";
 const LOSS = "var(--loss)";
@@ -49,10 +49,12 @@ const col = createColumnHelper<PositionDetail>();
 export default function PositionsTable({
   positions,
   baseCcy,
+  onSell,
 }: {
   positions: PositionDetail[];
   /** Portfolio base currency — every converted figure is rendered in it. */
   baseCcy: string;
+  onSell: (p: PositionDetail) => void;
 }) {
   const [sorting, setSorting] = useState<SortingState>([
     { id: "marketValue", desc: true },
@@ -127,7 +129,7 @@ export default function PositionsTable({
       }),
       col.accessor("quantity", {
         header: "Quantity",
-        cell: (c) => <span className="mono">{nf(c.getValue(), 0)}</span>,
+        cell: (c) => <span className="mono">{qty(c.getValue())}</span>,
       }),
       col.accessor("avgCost", {
         header: "Avg Cost",
@@ -193,6 +195,31 @@ export default function PositionsTable({
           );
         },
       }),
+      col.display({
+        id: "actions",
+        header: "",
+        cell: (c) => (
+          <button
+            onClick={(e) => {
+              e.stopPropagation(); // the row itself toggles the lot drill-in
+              onSell(c.row.original);
+            }}
+            style={{
+              padding: "3px 9px",
+              borderRadius: 6,
+              background: "transparent",
+              border: "1px solid rgba(255,255,255,.12)",
+              color: "#9aa1b2",
+              fontSize: 10.5,
+              fontWeight: 600,
+              cursor: "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            Sell
+          </button>
+        ),
+      }),
       col.accessor("unrealizedPnl", {
         header: "Unrl P&L",
         cell: (c) => {
@@ -218,7 +245,7 @@ export default function PositionsTable({
         },
       }),
     ],
-    [baseCcy],
+    [baseCcy, onSell],
   );
 
   const table = useReactTable({
@@ -471,7 +498,7 @@ function LotsPanel({
                 className="mono"
                 style={{ padding: "5px 8px", textAlign: "right", color: "#c5cad6" }}
               >
-                {nf(lot.quantity, 0)}
+                {qty(lot.quantity)}
               </td>
               <td
                 className="mono"

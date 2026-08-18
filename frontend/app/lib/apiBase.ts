@@ -31,3 +31,26 @@ export async function forward(
   const body = r.status === 204 || r.status === 304 ? null : await r.text();
   return new Response(body, { status: r.status, headers });
 }
+
+/**
+ * Read a JSON response, surfacing the API's `error` string on failure.
+ *
+ * The engine reports precise, actionable failures ("rate unavailable USD ->
+ * EUR on 2010-01-04"); throwing a bare status code throws that away and
+ * leaves the user with "HTTP 400".
+ */
+export async function getJson<T>(url: string): Promise<T> {
+  const r = await fetch(url, { cache: "no-store" });
+  const raw = await r.text();
+  if (!r.ok) {
+    let msg = "";
+    try {
+      const j = JSON.parse(raw);
+      if (j && typeof j.error === "string") msg = j.error;
+    } catch {
+      // non-JSON body; fall back to the status
+    }
+    throw new Error(msg || `HTTP ${r.status}`);
+  }
+  return JSON.parse(raw) as T;
+}

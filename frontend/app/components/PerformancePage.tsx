@@ -9,6 +9,7 @@ import type {
 } from "@/app/lib/performanceTypes";
 import type { PortfolioSummary } from "@/app/lib/portfolioTypes";
 import { MINUS, nf, shortDate } from "@/app/lib/format";
+import { getJson } from "@/app/lib/apiBase";
 import { place, type ChartHover } from "@/app/lib/chart/base";
 import RollingRatiosChart from "@/app/components/charts/RollingRatiosChart";
 import { Button } from "@/components/ui/button";
@@ -56,11 +57,7 @@ export default function PerformancePage({
   const load = useCallback((id: string | null, rfPct: number) => {
     if (!id) return Promise.resolve();
     const q = `rf=${(rfPct / 100).toFixed(4)}`;
-    return fetch(`/api/portfolio/${id}/performance?${q}`, { cache: "no-store" })
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
+    return getJson<PerformancePayload>(`/api/portfolio/${id}/performance?${q}`)
       .then((d: PerformancePayload) => {
         setData(d);
         setError(null);

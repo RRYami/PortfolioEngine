@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::auth::{self, SessionUser};
 use crate::dto::{
     AddHoldingReq, CreatePortfolioReq, PortfolioDetail, PortfolioSummary, PositionView,
+    SellHoldingReq,
     parse_currency, parse_lot_method,
 };
 use crate::error::ApiError;
@@ -56,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/portfolios/{id}", get(get_portfolio))
         .route("/api/portfolios/{id}/holdings", post(add_holding))
+        .route("/api/portfolios/{id}/sell", post(sell_holding))
         .route("/api/portfolios/{id}/positions", get(get_positions))
         .route("/api/portfolios/{id}/risk", get(get_risk))
         .route("/api/portfolios/{id}/performance", get(get_performance))
@@ -185,6 +187,70 @@ async fn add_holding(
     let buy_tx = Transaction::new(TransactionId::new(), date, date, buy)?;
     app.transactions.append(pid, &dep_tx).await?;
     app.transactions.append(pid, &buy_tx).await?;
+
+    Ok(Json(PortfolioSummary::from(&portfolio)))
+}
+
+/// Sell some or all of a position.
+///
+/// The mirror of [`add_holding`]'s deposit+buy desugaring: a `Sell` plus a
+/// `Withdrawal` of the proceeds, so cash does not accumulate in a book that
+/// only ever models securities.
+///
+/// The transaction log is append-only, so this is how a position is "removed":
+/// selling the full quantity leaves no open lots and the position stops
+/// appearing in the folded state.
+async fn sell_holding(
+    user: SessionUser,
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SellHoldingReq>,
+) -> Result<Json<PortfolioSummary>, ApiError> {
+    let pid = parse_id(&id)?;
+    let portfolio = owned_portfolio(&app, user.0.id, pid).await?;
+    if req.quantity <= Decimal::ZERO {
+        return Err(ApiError::BadRequest("quantity must be positive".into()));
+    }
+    if req.price <= Decimal::ZERO {
+        return Err(ApiError::BadRequest("price must be positive".into()));
+    }
+
+    let instrument = app
+        .instruments
+        .by_symbol(&req.ticker)
+        .await
+        .map_err(|_| ApiError::BadRequest(format!("unknown holding: {}", req.ticker)))?;
+
+    let date = req.date.unwrap_or_else(|| Utc::now().date_naive());
+
+    // Check availability *as of the trade date*, not today: this rejects both
+    // overselling and a sale dated before the shares were acquired, either of
+    // which would otherwise be appended and then break every later fold.
+    let prior: Vec<Transaction> = app.transactions.list_until(pid, date).await?;
+    let config = PortfolioConfig::new(portfolio.lot_method, portfolio.base_currency);
+    let held = fold(&prior, &config)?
+        .positions()
+        .get(&instrument.id)
+        .map_or(Decimal::ZERO, ptf_engine::Position::total_long_quantity);
+    if held < req.quantity {
+        return Err(ApiError::BadRequest(format!(
+            "cannot sell {} {} on {date} — only {held} held",
+            req.quantity, req.ticker
+        )));
+    }
+
+    let ccy = instrument.currency;
+    let price = Money::new(req.price, ccy);
+    let zero = Money::new(Decimal::ZERO, ccy);
+
+    // Desugar: sell, then withdraw the proceeds.
+    let sell = TransactionKind::sell(instrument.id, req.quantity, price, zero, None)?;
+    let withdrawal =
+        TransactionKind::withdrawal(Money::new(req.quantity * req.price, ccy))?;
+    let sell_tx = Transaction::new(TransactionId::new(), date, date, sell)?;
+    let wd_tx = Transaction::new(TransactionId::new(), date, date, withdrawal)?;
+    app.transactions.append(pid, &sell_tx).await?;
+    app.transactions.append(pid, &wd_tx).await?;
 
     Ok(Json(PortfolioSummary::from(&portfolio)))
 }

@@ -5,6 +5,7 @@ import type { CSSProperties } from "react";
 import type { Confidence, RiskPayload } from "@/app/lib/riskTypes";
 import { derive, type DerivedView } from "@/app/lib/derive";
 import { comp, MINUS, shortDate } from "@/app/lib/format";
+import { getJson } from "@/app/lib/apiBase";
 import { place, type ChartHover } from "@/app/lib/chart/base";
 import DrawdownChart from "@/app/components/charts/DrawdownChart";
 import HistVarChart from "@/app/components/charts/HistVarChart";
@@ -198,11 +199,7 @@ export default function RiskDashboard({
 
   const loadRisk = useCallback((id: string | null) => {
     if (!id) return Promise.resolve();
-    return fetch(`/api/portfolio/${id}/risk`, { cache: "no-store" })
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
+    return getJson<RiskPayload>(`/api/portfolio/${id}/risk`)
       .then((data: RiskPayload) => {
         setPayload(data);
         setError(null);

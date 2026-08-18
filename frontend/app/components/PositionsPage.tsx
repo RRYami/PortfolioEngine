@@ -4,8 +4,11 @@ import { useCallback, useEffect, useState } from "react";
 import type { PositionsPayload } from "@/app/lib/positionsTypes";
 import type { PortfolioSummary } from "@/app/lib/portfolioTypes";
 import { comp } from "@/app/lib/format";
+import { getJson } from "@/app/lib/apiBase";
 import { Button } from "@/components/ui/button";
 import PositionsTable from "./PositionsTable";
+import { SellHoldingDialog } from "./PortfolioDialogs";
+import type { PositionDetail } from "@/app/lib/positionsTypes";
 
 export interface PositionsPageProps {
   selectedId: string | null;
@@ -22,14 +25,12 @@ export default function PositionsPage({
 }: PositionsPageProps) {
   const [data, setData] = useState<PositionsPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The position the sell dialog is acting on; null when closed.
+  const [selling, setSelling] = useState<PositionDetail | null>(null);
 
   const load = useCallback((id: string | null) => {
     if (!id) return Promise.resolve();
-    return fetch(`/api/portfolio/${id}/positions`, { cache: "no-store" })
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
+    return getJson<PositionsPayload>(`/api/portfolio/${id}/positions`)
       .then((d: PositionsPayload) => {
         setData(d);
         setError(null);
@@ -127,8 +128,19 @@ export default function PositionsPage({
           </Button>
         </div>
       ) : (
-        <PositionsTable positions={data.positions} baseCcy={data.baseCcy} />
+        <PositionsTable
+          positions={data.positions}
+          baseCcy={data.baseCcy}
+          onSell={setSelling}
+        />
       )}
+      <SellHoldingDialog
+        open={selling != null}
+        onOpenChange={(v) => !v && setSelling(null)}
+        portfolioId={selectedId}
+        position={selling}
+        onSold={() => void load(selectedId)}
+      />
     </div>
   );
 }

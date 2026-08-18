@@ -10,6 +10,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { ccySym, nf, qty } from "@/app/lib/format";
+import type { PositionDetail } from "@/app/lib/positionsTypes";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import {
@@ -276,6 +278,172 @@ export function AddHoldingDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+export function SellHoldingDialog({
+  open,
+  onOpenChange,
+  portfolioId,
+  position,
+  onSold,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  portfolioId: string | null;
+  /** The position being sold; null while the dialog is closed. */
+  position: PositionDetail | null;
+  onSold: () => void;
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="dark">
+        {position && (
+          // Keyed on the holding so the form re-seeds from fresh props rather
+          // than resetting itself in an effect.
+          <SellForm
+            key={`${position.ticker}:${position.quantity}`}
+            portfolioId={portfolioId}
+            position={position}
+            onSold={onSold}
+            onOpenChange={onOpenChange}
+          />
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function SellForm({
+  portfolioId,
+  position,
+  onSold,
+  onOpenChange,
+}: {
+  portfolioId: string | null;
+  position: PositionDetail;
+  onSold: () => void;
+  onOpenChange: (v: boolean) => void;
+}) {
+  const today = new Date().toISOString().slice(0, 10);
+  // Default to closing the whole position at the last price — the common case.
+  // Partial sells are one edit (or one preset button) away.
+  const [quantity, setQuantity] = useState(qty(position.quantity));
+  const [price, setPrice] = useState(position.last.toFixed(2));
+  const [date, setDate] = useState(today);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const sellQty = Number(quantity);
+  const px = Number(price);
+  const held = position.quantity;
+  const partial = sellQty > 0 && sellQty < held;
+  const proceeds = sellQty > 0 && px > 0 ? sellQty * px : 0;
+  const sym = ccySym(position.ccy);
+
+  const submit = async () => {
+    if (!portfolioId) return;
+    if (!(sellQty > 0)) return setError("Quantity must be positive");
+    if (sellQty > held) return setError(`Only ${qty(held)} held`);
+    if (!(px > 0)) return setError("Price must be positive");
+    if (!date) return setError("Sale date is required");
+    setBusy(true);
+    setError(null);
+    try {
+      await postJson(`/api/portfolios/${portfolioId}/sell`, {
+        ticker: position.ticker,
+        quantity: sellQty,
+        price: px,
+        date,
+      });
+      onSold();
+      onOpenChange(false);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <DialogHeader>
+        <DialogTitle>Sell {position.ticker}</DialogTitle>
+        <DialogDescription>
+          Recorded as a sell + withdrawal in the transaction ledger. Selling the
+          full quantity closes the position.
+        </DialogDescription>
+      </DialogHeader>
+      <div className="flex flex-col gap-3 py-1">
+        <div className="grid grid-cols-2 gap-3">
+          <Field label={`Quantity (${nf(held, 0)} held)`}>
+            <Input
+              type="number"
+              value={quantity}
+              max={held}
+              onChange={(e) => setQuantity(e.target.value)}
+              autoFocus
+            />
+          </Field>
+          <Field label={`Price / unit (${position.ccy})`}>
+            <Input
+              type="number"
+              value={price}
+              onChange={(e) => setPrice(e.target.value)}
+            />
+          </Field>
+        </div>
+        <div className="flex gap-2">
+          {[0.25, 0.5, 0.75, 1].map((fr) => (
+            <Button
+              key={fr}
+              onClick={() => setQuantity(qty(held * fr))}
+              style={{
+                flex: 1,
+                background: "#14161d",
+                border: "1px solid rgba(255,255,255,.08)",
+                color: "#c5cad6",
+                fontSize: 11.5,
+              }}
+            >
+              {fr === 1 ? "All" : `${fr * 100}%`}
+            </Button>
+          ))}
+        </div>
+        <Field label="Sale date">
+          <Input
+            type="date"
+            value={date}
+            max={today}
+            onChange={(e) => setDate(e.target.value)}
+          />
+        </Field>
+        <div
+          className="mono"
+          style={{
+            fontSize: 11.5,
+            color: "#9aa1b2",
+            display: "flex",
+            justifyContent: "space-between",
+            gap: 12,
+          }}
+        >
+          <span style={{ whiteSpace: "nowrap" }}>
+            {partial ? "Remaining" : "Closes position"}
+          </span>
+          <span style={{ color: "#e8eaf0", whiteSpace: "nowrap" }}>
+            {partial ? `${qty(held - sellQty)} ${position.ticker} · ` : ""}
+            {sym + nf(proceeds, 2)} proceeds
+          </span>
+        </div>
+        {error && <p className="text-sm text-red-400">{error}</p>}
+      </div>
+      <DialogFooter>
+        <Button onClick={submit} disabled={busy} style={accentBtn}>
+          {busy ? "Selling…" : partial ? "Sell" : "Close position"}
+        </Button>
+      </DialogFooter>
+    </>
   );
 }
 

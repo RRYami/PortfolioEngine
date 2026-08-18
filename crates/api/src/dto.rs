@@ -54,6 +54,17 @@ pub struct AddHoldingReq {
     pub date: Option<NaiveDate>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SellHoldingReq {
+    pub ticker: String,
+    pub quantity: Decimal,
+    /// Sale price per unit, in the instrument's currency.
+    pub price: Decimal,
+    /// Trade date; defaults to today.
+    pub date: Option<NaiveDate>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PositionView {

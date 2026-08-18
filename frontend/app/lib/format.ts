@@ -46,6 +46,11 @@ export function comp(n: number, ccy: string): string {
   return (n < 0 ? MINUS : "") + s;
 }
 
+/** Share quantity: decimals only when the amount is actually fractional. */
+export function qty(n: number): string {
+  return Number.isInteger(n) ? nf(n, 0) : nf(n, 4).replace(/0+$/, "");
+}
+
 const MONTHS = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
