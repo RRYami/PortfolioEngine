@@ -59,6 +59,23 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* d3 axes / gridlines. The charts set these classes on their <g> wrappers so
+   axis styling lives in CSS rather than in per-chart attribute calls. */
+.d3-axis .domain,
+.d3-axis .tick line {
+  stroke: rgba(255, 255, 255, 0.12);
+}
+.d3-axis .tick text {
+  fill: #6b7280;
+  font: 600 9.5px/1 var(--font-plex-mono), monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.03em;
+}
+.d3-grid line {
+  stroke: rgba(255, 255, 255, 0.055);
+  shape-rendering: crispEdges;
+}
+
 .pe-row,
 .pe-comp-row {
   transition: background 0.12s;

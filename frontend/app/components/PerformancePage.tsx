@@ -9,6 +9,8 @@ import type {
 } from "@/app/lib/performanceTypes";
 import type { PortfolioSummary } from "@/app/lib/portfolioTypes";
 import { MINUS, nf, shortDate } from "@/app/lib/format";
+import { place, type ChartHover } from "@/app/lib/chart/base";
+import RollingRatiosChart from "@/app/components/charts/RollingRatiosChart";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
@@ -49,7 +51,7 @@ export default function PerformancePage({
   // Committed risk-free rate (annual %) + the editable draft in the input.
   const [rf, setRf] = useState(0);
   const [rfDraft, setRfDraft] = useState("0");
-  const [hover, setHover] = useState<number | null>(null);
+  const [hover, setHover] = useState<ChartHover | null>(null);
 
   const load = useCallback((id: string | null, rfPct: number) => {
     if (!id) return Promise.resolve();
@@ -75,7 +77,25 @@ export default function PerformancePage({
     setRf(Number.isFinite(v) ? v : 0);
   };
 
-  const chart = useMemo(() => buildChart(data), [data]);
+  // The chart needs a full window on both series before it has anything to
+  // draw; d3 owns the geometry from here on.
+  const hasChart = useMemo(() => {
+    const r = data?.rolling;
+    if (!r || r.dates.length < 2) return false;
+    return (
+      [...r.sharpe, ...r.sortino].filter((v) => v != null).length >= 2
+    );
+  }, [data]);
+
+  const onChartHover = useCallback((h: ChartHover | null) => {
+    setHover((H) =>
+      !h
+        ? null
+        : !H || H.i !== h.i || Math.abs(H.py - h.py) > 4
+          ? h
+          : H,
+    );
+  }, []);
 
   const header = (
     <div
@@ -183,13 +203,14 @@ export default function PerformancePage({
     { label: "Max Drawdown", value: nf(s.maxDrawdownPct, 1) + "%", color: LOSS, sub: "peak to trough" },
   ];
 
+  const r = data?.rolling;
   const hoverInfo =
-    chart && hover != null && hover >= 0 && hover < chart.dates.length
+    r && hover && hover.i >= 0 && hover.i < r.dates.length
       ? {
-          date: chart.dates[hover],
-          sharpe: chart.sharpe[hover],
-          sortino: chart.sortino[hover],
-          x: chart.x(hover),
+          date: r.dates[hover.i],
+          sharpe: r.sharpe[hover.i],
+          sortino: r.sortino[hover.i],
+          ...place(hover.cx, hover.py, hover.w),
         }
       : null;
 
@@ -234,54 +255,22 @@ export default function PerformancePage({
             <Legend color={SORTINO} label="Sortino" />
           </div>
         </div>
-        {chart ? (
-          <div
-            style={{ position: "relative", marginTop: 12, cursor: "crosshair" }}
-            onMouseMove={(e) => {
-              const r = e.currentTarget.getBoundingClientRect();
-              const f = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
-              setHover(Math.round(f * (chart.dates.length - 1)));
-            }}
-            onMouseLeave={() => setHover(null)}
-          >
-            <svg
-              viewBox={`0 0 ${chart.W} ${chart.H}`}
-              preserveAspectRatio="none"
-              style={{ width: "100%", height: 200, display: "block", overflow: "visible" }}
-            >
-              {chart.zeroY != null && (
-                <line
-                  x1={0}
-                  y1={chart.zeroY}
-                  x2={chart.W}
-                  y2={chart.zeroY}
-                  stroke="rgba(255,255,255,.14)"
-                  strokeWidth={1}
-                  strokeDasharray="3 4"
-                />
-              )}
-              <path d={chart.sortinoPath} fill="none" stroke={SORTINO} strokeWidth={1.6} />
-              <path d={chart.sharpePath} fill="none" stroke={ACCENT} strokeWidth={2} />
-              {hoverInfo && (
-                <line
-                  x1={hoverInfo.x}
-                  y1={0}
-                  x2={hoverInfo.x}
-                  y2={chart.H}
-                  stroke={ACCENT}
-                  strokeWidth={1}
-                  opacity={0.5}
-                />
-              )}
-            </svg>
+        {hasChart ? (
+          <div style={{ position: "relative", marginTop: 12 }}>
+            <RollingRatiosChart
+              dates={data.rolling.dates}
+              sharpe={data.rolling.sharpe}
+              sortino={data.rolling.sortino}
+              hoverIndex={hover?.i ?? null}
+              onHover={onChartHover}
+            />
             {hoverInfo && (
               <div
                 style={{
                   position: "absolute",
-                  top: 0,
-                  left: `${(hoverInfo.x / chart.W) * 100}%`,
-                  transform:
-                    hoverInfo.x > chart.W * 0.6 ? "translateX(-108%)" : "translateX(8%)",
+                  left: hoverInfo.left,
+                  top: hoverInfo.top,
+                  transform: hoverInfo.transform,
                   background: "#05060a",
                   border: "1px solid rgba(255,255,255,.13)",
                   borderRadius: 9,
@@ -289,6 +278,7 @@ export default function PerformancePage({
                   pointerEvents: "none",
                   whiteSpace: "nowrap",
                   boxShadow: "0 14px 34px rgba(0,0,0,.6)",
+                  zIndex: 20,
                 }}
               >
                 <div className="pe-lbl" style={{ color: NEUTRAL, marginBottom: 6 }}>
@@ -456,67 +446,4 @@ function RelativePanel({ relative, rfPct }: { relative: RelativeStats | null; rf
       </div>
     </div>
   );
-}
-
-interface ChartView {
-  W: number;
-  H: number;
-  sharpePath: string;
-  sortinoPath: string;
-  zeroY: number | null;
-  dates: string[];
-  sharpe: (number | null)[];
-  sortino: (number | null)[];
-  x: (i: number) => number;
-}
-
-/** Map the rolling series onto SVG paths (nulls at the head are skipped). */
-function buildChart(data: PerformancePayload | null): ChartView | null {
-  const r = data?.rolling;
-  if (!r) return null;
-  const n = r.dates.length;
-  const present = [...r.sharpe, ...r.sortino].filter(
-    (v): v is number => v != null,
-  );
-  if (n < 2 || present.length < 2) return null;
-
-  let min = Math.min(...present, 0);
-  let max = Math.max(...present, 0);
-  if (min === max) {
-    min -= 1;
-    max += 1;
-  }
-  const pad = (max - min) * 0.08;
-  min -= pad;
-  max += pad;
-
-  const W = 800;
-  const H = 220;
-  const p = 6;
-  const x = (i: number) => (n === 1 ? 0 : (i / (n - 1)) * W);
-  const y = (v: number) => H - p - ((v - min) / (max - min)) * (H - 2 * p);
-
-  const pathOf = (arr: (number | null)[]): string => {
-    let d = "";
-    let started = false;
-    for (let i = 0; i < arr.length; i++) {
-      const v = arr[i];
-      if (v == null) continue;
-      d += `${started ? "L" : "M"}${x(i).toFixed(1)} ${y(v).toFixed(1)} `;
-      started = true;
-    }
-    return d.trim();
-  };
-
-  return {
-    W,
-    H,
-    sharpePath: pathOf(r.sharpe),
-    sortinoPath: pathOf(r.sortino),
-    zeroY: min < 0 && max > 0 ? y(0) : null,
-    dates: r.dates,
-    sharpe: r.sharpe,
-    sortino: r.sortino,
-    x,
-  };
 }

@@ -1,15 +1,15 @@
-// Pure derivation of the view-model: formatted strings + SVG chart geometry,
-// computed from the engine payload and the selected confidence level. This is
-// the "the dashboard does all formatting and SVG geometry" half of the seam —
-// ported from the prototype's renderVals().
+// Pure derivation of the view-model: the formatted strings and the raw series
+// the charts need, computed from the engine payload and the selected
+// confidence level.
+//
+// Chart *geometry* deliberately lives no longer here — d3 builds scales and
+// paths at render time from these raw numbers, so this module only formats.
 
 import type { Confidence, RiskPayload } from "./riskTypes";
-import { asOfLabel, comp, MINUS, nf, shortDate } from "./format";
+import { asOfLabel, comp, MINUS, nf } from "./format";
 
-const ACCENT = "var(--accent)";
 const GAIN = "var(--gain)";
 const LOSS = "var(--loss)";
-const LOSS_DEEP = "var(--lossDeep)";
 
 export interface Kpi {
   label: string;
@@ -37,14 +37,6 @@ export interface CompRow {
   barPct: number;
 }
 
-export interface Bar {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  fill: string;
-}
-
 export interface DerivedView {
   confL: string;
   asOf: string;
@@ -55,34 +47,30 @@ export interface DerivedView {
   var1dBoth: string;
   es1dBoth: string;
   dist: {
-    bars: Bar[];
-    varx: number;
-    esx: number;
-    // raw values for hover tooltips
     binLow: number;
     binHigh: number;
     binCount: number;
+    /** Bin width, in P&L currency units. */
     bw: number;
     counts: number[];
     paths: number;
-    tV: number;
+    /** P&L cutoffs (negative): VaR line, ES line, deep-tail colour boundary. */
+    varV: number;
+    esV: number;
     deepV: number;
   };
   dd: {
-    line: string;
-    area: string;
     maxL: string;
     series: number[];
+    /** ISO dates — the time scale parses these; tooltips format them. */
     dates: string[];
   };
   histVar: {
-    line1d: string;
-    area1d: string;
-    line20d: string;
     cur1d: string;
     cur20d: string;
     v1d: number[];
     v20d: number[];
+    /** ISO dates. */
     dates: string[];
   };
 }
@@ -183,28 +171,7 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
   const { binLow: lo, binHigh: hi, binCount: nb, counts, paths } =
     payload.pnlDistribution;
   const bw = (hi - lo) / nb;
-  const mc = Math.max(...counts, 1); // guard /0 when a book has no holdings
   const cut = payload.pnlDistribution.cutoffs[conf];
-  const tV = cut.var;
-  const deepV = cut.deep;
-  const esVal = cut.es;
-  const mapX = (x: number) => round1(((x - lo) / (hi - lo)) * 800);
-  const bars: Bar[] = counts.map((c, i) => {
-    const h = (c / mc) * 244;
-    const x = mapX(lo + i * bw) + 1;
-    const w = Math.max(1, 800 / nb - 2);
-    const center = lo + (i + 0.5) * bw;
-    let fill = ACCENT;
-    if (center <= deepV) fill = LOSS_DEEP;
-    else if (center <= tV) fill = LOSS;
-    return {
-      x,
-      y: round1(268 - h),
-      w: round1(w),
-      h: round1(Math.max(0, h)),
-      fill,
-    };
-  });
 
   const var1dBoth = comp(-r.var1d) + " (" + var1dPctS + ")";
   const es1dBoth = comp(-r.es1d) + " (" + es1dPctS + ")";
@@ -212,29 +179,13 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
   // ---- Drawdown underwater curve ----
   const ddSeries = payload.drawdown.series; // % from peak, ≤ 0
   const maxDD = payload.drawdown.maxPct;
-  const Nd = ddSeries.length;
-  const ddPts = ddSeries.map((d, i) => {
-    const x = round1((i / (Nd - 1)) * 800);
-    const y = round1(10 + (maxDD !== 0 ? d / maxDD : 0) * 180);
-    return [x, y] as const;
-  });
-  const ddLine = "M" + ddPts.map((p) => p[0] + " " + p[1]).join(" L ");
-  const ddArea = ddLine + " L 800 10 L 0 10 Z";
-  const ddDates = payload.drawdown.dates.map(shortDate);
 
   // ---- Historical VaR series ----
   const v1d = payload.histVar.var1dPct[conf]; // positive %
   const v20d = payload.histVar.var20dPct[conf];
-  const maxHV = (Math.max(...v20d, 0) * 1.1) || 1; // guard empty / zero-vol
-  const hMapY = (v: number) => round1(185 - (v / maxHV) * 173);
-  const hX = (i: number) => round1((i / (Nd - 1)) * 800);
-  const line1d = "M" + v1d.map((v, i) => hX(i) + " " + hMapY(v)).join(" L ");
-  const area1d = line1d + " L 800 185 L 0 185 Z";
-  const line20d = "M" + v20d.map((v, i) => hX(i) + " " + hMapY(v)).join(" L ");
   // `?? 0` so a book with no holdings (empty series) doesn't crash on .toFixed.
   const cur1dPct = v1d.at(-1) ?? 0;
   const cur20dPct = v20d.at(-1) ?? 0;
-  const histDates = payload.histVar.dates.map(shortDate);
 
   return {
     confL,
@@ -246,29 +197,22 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
     var1dBoth,
     es1dBoth,
     dist: {
-      bars,
-      varx: mapX(tV),
-      esx: mapX(esVal),
       binLow: lo,
       binHigh: hi,
       binCount: nb,
       bw,
       counts,
       paths,
-      tV,
-      deepV,
+      varV: cut.var,
+      esV: cut.es,
+      deepV: cut.deep,
     },
     dd: {
-      line: ddLine,
-      area: ddArea,
       maxL: maxDD.toFixed(1) + "%",
       series: ddSeries,
-      dates: ddDates,
+      dates: payload.drawdown.dates,
     },
     histVar: {
-      line1d,
-      area1d,
-      line20d,
       cur1d:
         MINUS + comp((cur1dPct / 100) * tot) + " · " + MINUS +
         cur1dPct.toFixed(2) + "%",
@@ -277,7 +221,7 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
         cur20dPct.toFixed(2) + "%",
       v1d,
       v20d,
-      dates: histDates,
+      dates: payload.histVar.dates,
     },
   };
 }

@@ -4,7 +4,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import type { Confidence, RiskPayload } from "@/app/lib/riskTypes";
 import { derive, type DerivedView } from "@/app/lib/derive";
-import { comp, MINUS } from "@/app/lib/format";
+import { comp, MINUS, shortDate } from "@/app/lib/format";
+import { place, type ChartHover } from "@/app/lib/chart/base";
+import DrawdownChart from "@/app/components/charts/DrawdownChart";
+import HistVarChart from "@/app/components/charts/HistVarChart";
+import PnlDistributionChart from "@/app/components/charts/PnlDistributionChart";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -21,12 +25,9 @@ import type { PortfolioSummary } from "@/app/lib/portfolioTypes";
 
 type ChartKind = "dist" | "hist" | "dd";
 
-interface HoverState {
+/** A `ChartHover` from one of the d3 charts, tagged with which chart sent it. */
+interface HoverState extends ChartHover {
   chart: ChartKind;
-  i: number;
-  px: number;
-  py: number;
-  w: number;
 }
 
 interface TipRow {
@@ -39,30 +40,18 @@ interface Tip {
   left: string;
   top: string;
   transform: string;
-  crossLeft: string;
-  crossColor: string;
   title: string;
   titleColor: string;
   rows: TipRow[];
 }
 
-
-function place(cx: number, py: number, w: number) {
-  const left = cx > w * 0.6;
-  return {
-    left: (left ? cx - 12 : cx + 12) + "px",
-    top: Math.max(2, py - 6) + "px",
-    transform: left ? "translateX(-100%)" : "none",
-  };
-}
-
 function buildTip(v: DerivedView, conf: Confidence, h: HoverState): Tip | null {
-  const { i, w, py } = h;
+  const { i, w, py, cx } = h;
   const tot = v.tot;
   const pctOf = (x: number) => (x / tot) * 100;
 
   if (h.chart === "dist") {
-    const { binLow: lo, bw, binCount: nb, counts, paths, tV, deepV } = v.dist;
+    const { binLow: lo, bw, counts, paths, varV, deepV } = v.dist;
     const low = lo + i * bw;
     const high = lo + (i + 1) * bw;
     const center = (low + high) / 2;
@@ -72,15 +61,12 @@ function buildTip(v: DerivedView, conf: Confidence, h: HoverState): Tip | null {
     if (center <= deepV) {
       title = "Beyond " + (conf === 99 ? "99.75%" : "99%") + " tail";
       tc = "var(--lossDeep)";
-    } else if (center <= tV) {
+    } else if (center <= varV) {
       title = "In " + v.confL + " tail";
       tc = "var(--loss)";
     }
-    const cx = ((i + 0.5) / nb) * w;
     return {
       ...place(cx, py, w),
-      crossLeft: cx + "px",
-      crossColor: "var(--accent)",
       title,
       titleColor: tc,
       rows: [
@@ -97,13 +83,9 @@ function buildTip(v: DerivedView, conf: Confidence, h: HoverState): Tip | null {
 
   if (h.chart === "hist") {
     const { v1d, v20d, dates } = v.histVar;
-    const n = dates.length;
-    const cx = (i / (n - 1)) * w;
     return {
       ...place(cx, py, w),
-      crossLeft: cx + "px",
-      crossColor: "var(--accent)",
-      title: dates[i],
+      title: shortDate(dates[i]),
       titleColor: "#c5cad6",
       rows: [
         {
@@ -126,14 +108,10 @@ function buildTip(v: DerivedView, conf: Confidence, h: HoverState): Tip | null {
 
   // drawdown
   const { series, dates } = v.dd;
-  const n = dates.length;
   const d = series[i];
-  const cx = (i / (n - 1)) * w;
   return {
     ...place(cx, py, w),
-    crossLeft: cx + "px",
-    crossColor: "var(--loss)",
-    title: dates[i],
+    title: shortDate(dates[i]),
     titleColor: "#c5cad6",
     rows: [
       { k: "Drawdown", v: d.toFixed(2) + "%", c: "var(--loss)" },
@@ -148,65 +126,51 @@ function buildTip(v: DerivedView, conf: Confidence, h: HoverState): Tip | null {
 
 function Tooltip({ tip }: { tip: Tip }) {
   return (
-    <>
+    <div
+      style={{
+        position: "absolute",
+        left: tip.left,
+        top: tip.top,
+        transform: tip.transform,
+        pointerEvents: "none",
+        background: "#05060a",
+        border: "1px solid rgba(255,255,255,.13)",
+        borderRadius: 9,
+        padding: "8px 10px",
+        boxShadow: "0 14px 34px rgba(0,0,0,.6)",
+        zIndex: 20,
+        whiteSpace: "nowrap",
+      }}
+    >
       <div
         style={{
-          position: "absolute",
-          left: tip.crossLeft,
-          top: 0,
-          width: 1,
-          height: "100%",
-          background: tip.crossColor,
-          opacity: 0.55,
-          pointerEvents: "none",
-        }}
-      />
-      <div
-        style={{
-          position: "absolute",
-          left: tip.left,
-          top: tip.top,
-          transform: tip.transform,
-          pointerEvents: "none",
-          background: "#05060a",
-          border: "1px solid rgba(255,255,255,.13)",
-          borderRadius: 9,
-          padding: "8px 10px",
-          boxShadow: "0 14px 34px rgba(0,0,0,.6)",
-          zIndex: 20,
-          whiteSpace: "nowrap",
+          font: "700 10px/1 var(--font-manrope), sans-serif",
+          letterSpacing: ".04em",
+          textTransform: "uppercase",
+          color: tip.titleColor,
+          marginBottom: 7,
         }}
       >
+        {tip.title}
+      </div>
+      {tip.rows.map((r, idx) => (
         <div
+          key={idx}
           style={{
-            font: "700 10px/1 var(--font-manrope), sans-serif",
-            letterSpacing: ".04em",
-            textTransform: "uppercase",
-            color: tip.titleColor,
-            marginBottom: 7,
+            display: "flex",
+            justifyContent: "space-between",
+            gap: 16,
+            fontSize: 10.5,
+            marginTop: 3,
           }}
         >
-          {tip.title}
+          <span style={{ color: "#6b7280" }}>{r.k}</span>
+          <span className="mono" style={{ color: r.c }}>
+            {r.v}
+          </span>
         </div>
-        {tip.rows.map((r, idx) => (
-          <div
-            key={idx}
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              gap: 16,
-              fontSize: 10.5,
-              marginTop: 3,
-            }}
-          >
-            <span style={{ color: "#6b7280" }}>{r.k}</span>
-            <span className="mono" style={{ color: r.c }}>
-              {r.v}
-            </span>
-          </div>
-        ))}
-      </div>
-    </>
+      ))}
+    </div>
   );
 }
 
@@ -254,22 +218,26 @@ export default function RiskDashboard({
     [payload, conf],
   );
 
-  const mkMove =
-    (chart: ChartKind, n: number) =>
-    (e: React.MouseEvent<HTMLDivElement>) => {
-      const r = e.currentTarget.getBoundingClientRect();
-      const px = e.clientX - r.left;
-      const py = e.clientY - r.top;
-      let f = px / r.width;
-      f = Math.max(0, Math.min(0.999999, f));
-      const i = chart === "dist" ? Math.floor(f * n) : Math.round(f * (n - 1));
-      setHover((H) =>
-        !H || H.chart !== chart || H.i !== i || Math.abs(H.py - py) > 4
-          ? { chart, i, px, py, w: r.width }
-          : H,
-      );
-    };
-  const onChartLeave = () => setHover(null);
+  // The charts resolve the pointer to a datum against their own d3 scales and
+  // hand back container pixels; this only tags which chart spoke and drops
+  // no-op updates so the tooltip doesn't re-render on every mouse event.
+  const mkHover = useCallback(
+    (chart: ChartKind) => (h: ChartHover | null) => {
+      setHover((H) => {
+        if (!h) return H === null ? H : null;
+        return !H ||
+          H.chart !== chart ||
+          H.i !== h.i ||
+          Math.abs(H.py - h.py) > 4
+          ? { ...h, chart }
+          : H;
+      });
+    },
+    [],
+  );
+  const onDistHover = useMemo(() => mkHover("dist"), [mkHover]);
+  const onDdHover = useMemo(() => mkHover("dd"), [mkHover]);
+  const onHistHover = useMemo(() => mkHover("hist"), [mkHover]);
 
   const segBase: CSSProperties = {
     padding: "5px 12px",
@@ -493,55 +461,19 @@ export default function RiskDashboard({
                     </div>
                     <div className="pe-lbl">Monte Carlo · 20,000 paths</div>
                   </div>
-                  <div
-                    style={{
-                      position: "relative",
-                      marginTop: 12,
-                      cursor: "crosshair",
-                    }}
-                    onMouseMove={mkMove("dist", view.dist.binCount)}
-                    onMouseLeave={onChartLeave}
-                  >
-                    <svg
-                      viewBox="0 0 800 290"
-                      preserveAspectRatio="none"
-                      style={{
-                        width: "100%",
-                        height: 208,
-                        display: "block",
-                        overflow: "visible",
-                      }}
-                    >
-                      {view.dist.bars.map((b, i) => (
-                        <rect
-                          key={i}
-                          x={b.x}
-                          y={b.y}
-                          width={b.w}
-                          height={b.h}
-                          rx={1.5}
-                          fill={b.fill}
-                        />
-                      ))}
-                      <line
-                        x1={view.dist.esx}
-                        y1={2}
-                        x2={view.dist.esx}
-                        y2={274}
-                        stroke="var(--loss)"
-                        strokeWidth={1.8}
-                        strokeDasharray="5 4"
-                      />
-                      <line
-                        x1={view.dist.varx}
-                        y1={2}
-                        x2={view.dist.varx}
-                        y2={274}
-                        stroke="#fbbf24"
-                        strokeWidth={1.8}
-                        strokeDasharray="5 4"
-                      />
-                    </svg>
+                  <div style={{ position: "relative", marginTop: 12 }}>
+                    <PnlDistributionChart
+                      binLow={view.dist.binLow}
+                      binHigh={view.dist.binHigh}
+                      binCount={view.dist.binCount}
+                      counts={view.dist.counts}
+                      paths={view.dist.paths}
+                      varV={view.dist.varV}
+                      esV={view.dist.esV}
+                      deepV={view.dist.deepV}
+                      hoverIndex={hover?.chart === "dist" ? hover.i : null}
+                      onHover={onDistHover}
+                    />
                     {distTip && <Tooltip tip={distTip} />}
                   </div>
                   <div
@@ -618,57 +550,13 @@ export default function RiskDashboard({
                       </span>
                     </div>
                   </div>
-                  <div
-                    style={{
-                      position: "relative",
-                      marginTop: 12,
-                      cursor: "crosshair",
-                    }}
-                    onMouseMove={mkMove("dd", view.dd.dates.length)}
-                    onMouseLeave={onChartLeave}
-                  >
-                    <svg
-                      viewBox="0 0 800 200"
-                      preserveAspectRatio="none"
-                      style={{ width: "100%", height: 150, display: "block" }}
-                    >
-                      <defs>
-                        <linearGradient
-                          id="ddgA"
-                          x1="0"
-                          y1="0"
-                          x2="0"
-                          y2="1"
-                        >
-                          <stop
-                            offset="0%"
-                            stopColor="var(--loss)"
-                            stopOpacity={0.42}
-                          />
-                          <stop
-                            offset="100%"
-                            stopColor="var(--loss)"
-                            stopOpacity={0.02}
-                          />
-                        </linearGradient>
-                      </defs>
-                      <line
-                        x1={0}
-                        y1={10}
-                        x2={800}
-                        y2={10}
-                        stroke="rgba(255,255,255,.12)"
-                        strokeWidth={1}
-                        strokeDasharray="3 4"
-                      />
-                      <path d={view.dd.area} fill="url(#ddgA)" />
-                      <path
-                        d={view.dd.line}
-                        fill="none"
-                        stroke="var(--loss)"
-                        strokeWidth={1.6}
-                      />
-                    </svg>
+                  <div style={{ position: "relative", marginTop: 12 }}>
+                    <DrawdownChart
+                      dates={view.dd.dates}
+                      series={view.dd.series}
+                      hoverIndex={hover?.chart === "dd" ? hover.i : null}
+                      onHover={onDdHover}
+                    />
                     {ddTip && <Tooltip tip={ddTip} />}
                   </div>
                 </div>
@@ -979,57 +867,14 @@ export default function RiskDashboard({
                   </div>
                 </div>
               </div>
-              <div
-                style={{
-                  position: "relative",
-                  marginTop: 12,
-                  cursor: "crosshair",
-                }}
-                onMouseMove={mkMove("hist", view.histVar.dates.length)}
-                onMouseLeave={onChartLeave}
-              >
-                <svg
-                  viewBox="0 0 800 200"
-                  preserveAspectRatio="none"
-                  style={{ width: "100%", height: 160, display: "block" }}
-                >
-                  <defs>
-                    <linearGradient id="hvgA" x1="0" y1="0" x2="0" y2="1">
-                      <stop
-                        offset="0%"
-                        stopColor="var(--accent)"
-                        stopOpacity={0.26}
-                      />
-                      <stop
-                        offset="100%"
-                        stopColor="var(--accent)"
-                        stopOpacity={0.02}
-                      />
-                    </linearGradient>
-                  </defs>
-                  <line
-                    x1={0}
-                    y1={185}
-                    x2={800}
-                    y2={185}
-                    stroke="rgba(255,255,255,.10)"
-                    strokeWidth={1}
-                  />
-                  <path d={view.histVar.area1d} fill="url(#hvgA)" />
-                  <path
-                    d={view.histVar.line20d}
-                    fill="none"
-                    stroke="var(--loss)"
-                    strokeWidth={1.6}
-                    strokeDasharray="5 4"
-                  />
-                  <path
-                    d={view.histVar.line1d}
-                    fill="none"
-                    stroke="var(--accent)"
-                    strokeWidth={2}
-                  />
-                </svg>
+              <div style={{ position: "relative", marginTop: 12 }}>
+                <HistVarChart
+                  dates={view.histVar.dates}
+                  v1d={view.histVar.v1d}
+                  v20d={view.histVar.v20d}
+                  hoverIndex={hover?.chart === "hist" ? hover.i : null}
+                  onHover={onHistHover}
+                />
                 {histTip && <Tooltip tip={histTip} />}
               </div>
               <div style={{ display: "flex", gap: 18, marginTop: 11 }}>
