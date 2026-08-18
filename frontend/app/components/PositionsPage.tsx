@@ -67,7 +67,7 @@ export default function PositionsPage({
               className="mono"
               style={{ fontSize: 16, fontWeight: 600, marginTop: 2 }}
             >
-              {comp(data.totalValue)}{" "}
+              {comp(data.totalValue, data.baseCcy)}{" "}
               <span style={{ color: "#6b7280", fontSize: 11 }}>
                 {data.baseCcy}
               </span>
@@ -127,7 +127,7 @@ export default function PositionsPage({
           </Button>
         </div>
       ) : (
-        <PositionsTable positions={data.positions} />
+        <PositionsTable positions={data.positions} baseCcy={data.baseCcy} />
       )}
     </div>
   );

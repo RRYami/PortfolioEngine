@@ -2,7 +2,8 @@
 //!
 //! Both the risk dashboard (drawdown / historical `VaR`) and the performance-ratio
 //! tab derive their series from the same trailing equity curve: the *current*
-//! holdings valued at each historical close, FX-converted to base at `as_of`.
+//! holdings valued at each historical close, FX-converted to base at the
+//! rate that applied on that date.
 //! It is a current-book curve — a "what if I had held today's book over the
 //! window" series — not a realized position-by-position track record.
 
@@ -36,12 +37,16 @@ pub fn series(
 
     for (inst_id, pos) in state.positions() {
         let qty = f(pos.net_quantity());
-        let fx = f(pd.fx.rate(pos.currency(), base, as_of)?);
+        let ccy = pos.currency();
         let hist = pd.historical.prices(*inst_id, from, as_of)?;
-        let map: BTreeMap<NaiveDate, f64> = hist
-            .iter()
-            .map(|(d, m)| (*d, f(m.amount) * qty * fx))
-            .collect();
+        // FX is applied per date, not once at `as_of`: for a base currency
+        // that moved against the position's currency, the FX leg is part of
+        // the return, and freezing it understates realised volatility.
+        let mut map: BTreeMap<NaiveDate, f64> = BTreeMap::new();
+        for (d, m) in &hist {
+            let fx = f(pd.fx.rate(ccy, base, *d)?);
+            map.insert(*d, f(m.amount) * qty * fx);
+        }
         let dates: BTreeSet<NaiveDate> = map.keys().copied().collect();
         common = Some(match common {
             None => dates,

@@ -7,6 +7,10 @@ live only here.
 Run:  uv run uvicorn server:app --port 8001
 Endpoints:
   POST /ensure {"symbols": ["AAPL", ...], "period": "2y"}
+
+FX is stored as a dated series, not a spot snapshot: converting a tax lot's
+cost at its own trade-date rate (and valuing a historical equity curve) needs
+a rate per day, not one rate for everything.
   GET  /health
 """
 
@@ -28,6 +32,12 @@ DB_PATH = DATA / "prices.duckdb"
 PRICES_PARQUET = DATA / "prices.parquet"
 FX_PARQUET = DATA / "fx.parquet"
 
+# How far back to pull FX. Deliberately longer than the default price window:
+# a tax lot can be far older than the price history a risk chart needs, and its
+# cost must be converted at *its* trade-date rate. Five daily series is a
+# rounding error next to per-symbol price history, so the window is cheap.
+FX_PERIOD = os.environ.get("FX_PERIOD", "10y")
+
 # yfinance FX symbols → how to turn the quote into USD-per-unit.
 FX_SYMBOLS = {
     "USD": None,
@@ -47,9 +57,22 @@ def connect() -> duckdb.DuckDBPyConnection:
                symbol VARCHAR, date DATE, close DOUBLE,
                PRIMARY KEY (symbol, date))"""
     )
+    # The fx table used to be a spot snapshot keyed by ccy alone. DuckDB cannot
+    # add a column to a primary key in place, so an old cache is dropped and
+    # refetched — cheap, and it keeps the shape unambiguous.
+    cols = {
+        r[0]
+        for r in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'fx'"
+        ).fetchall()
+    }
+    if cols and "date" not in cols:
+        con.execute("DROP TABLE fx")
     con.execute(
         """CREATE TABLE IF NOT EXISTS fx(
-               ccy VARCHAR PRIMARY KEY, usd_per_unit DOUBLE, asof_date DATE)"""
+               ccy VARCHAR, date DATE, usd_per_unit DOUBLE,
+               PRIMARY KEY (ccy, date))"""
     )
     return con
 
@@ -94,25 +117,47 @@ def fetch_symbol(con, symbol: str, period: str, force: bool) -> dict:
     return {"rows": row[0], "last": str(row[1]), "cached": False}
 
 
-def fetch_fx(con) -> dict:
-    today = dt.date.today()
-    out = {}
+def fetch_fx(con, period: str = FX_PERIOD) -> dict:
+    """Refresh the dated USD-per-unit series for every supported currency."""
+    out: dict[str, dict | str] = {}
+    dates: set[dt.date] = set()
+
     for ccy, spec in FX_SYMBOLS.items():
         if spec is None:
-            con.execute("INSERT OR REPLACE INTO fx VALUES ('USD', 1.0, ?)", [today])
-            out["USD"] = 1.0
-            continue
+            continue  # USD is filled in below, once the date span is known
         sym, invert = spec
         try:
-            h = yf.Ticker(sym).history(period="5d", interval="1d", auto_adjust=True)
-            last = float(h["Close"].dropna().iloc[-1])
-            usd_per = (1.0 / last) if invert else last
-            con.execute(
-                "INSERT OR REPLACE INTO fx VALUES (?, ?, ?)", [ccy, usd_per, today]
-            )
-            out[ccy] = round(usd_per, 6)
+            h = yf.Ticker(sym).history(period=period, interval="1d", auto_adjust=True)
+            closes = h["Close"].dropna()
+            if closes.empty:
+                out[ccy] = "error: no data"
+                continue
+            rows = []
+            for ts, close in closes.items():
+                close = float(close)
+                if close == 0.0:
+                    continue  # a zero quote would invert to infinity
+                d = ts.date()
+                rows.append((ccy, d, (1.0 / close) if invert else close))
+                dates.add(d)
+            con.executemany("INSERT OR REPLACE INTO fx VALUES (?, ?, ?)", rows)
+            out[ccy] = {
+                "rows": len(rows),
+                "first": str(rows[0][1]),
+                "last": str(rows[-1][1]),
+                "latest": round(rows[-1][2], 6),
+            }
         except Exception as e:  # noqa: BLE001
             out[ccy] = f"error: {e}"
+
+    # USD is the pivot: 1.0 on every date any other currency quotes, so a
+    # USD-denominated lot never misses a rate the others have.
+    if dates:
+        con.executemany(
+            "INSERT OR REPLACE INTO fx VALUES (?, ?, ?)",
+            [("USD", d, 1.0) for d in sorted(dates)],
+        )
+        out["USD"] = {"rows": len(dates), "latest": 1.0}
     return out
 
 
@@ -123,7 +168,9 @@ def export(con) -> None:
             TO '{PRICES_PARQUET}' (FORMAT PARQUET)"""
     )
     con.execute(
-        f"COPY (SELECT ccy, usd_per_unit FROM fx) TO '{FX_PARQUET}' (FORMAT PARQUET)"
+        f"""COPY (SELECT ccy, strftime(date, '%Y-%m-%d') AS date, usd_per_unit
+                  FROM fx ORDER BY ccy, date)
+            TO '{FX_PARQUET}' (FORMAT PARQUET)"""
     )
 
 

@@ -163,8 +163,14 @@ pub fn build(
         let fx = f(pd.fx.rate(ccy, base, as_of)?);
         let mv_native = qty * price;
         let mv_base = mv_native * fx;
-        let cost_native = f(pos.long_cost_basis().amount);
-        let upnl_base = (mv_native - cost_native) * fx;
+        // Cost per lot at its own trade-date rate, matching the positions page:
+        // the two views must not disagree about the same book's P&L.
+        let mut cost_base = 0.0;
+        for lot in pos.long_lots() {
+            let lot_fx = f(pd.fx_trade_date.rate(ccy, base, lot.open_date())?);
+            cost_base += f(lot.quantity()) * f(lot.basis_per_unit().amount) * lot_fx;
+        }
+        let upnl_base = mv_base - cost_base;
         total_mv += mv_base;
         let ticker = meta.map_or_else(|| inst_id.0.to_string(), |m| m.symbol.clone());
         let name = names

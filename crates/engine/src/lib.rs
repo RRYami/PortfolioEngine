@@ -27,7 +27,10 @@ pub mod valuation;
 pub use currency::Currency;
 pub use error::DomainError;
 pub use fold::fold;
-pub use fx::{FxError, FxRateProvider, StaticFxRateProvider, TriangulatingFxProvider};
+pub use fx::{
+    FxError, FxRateProvider, HistoricalFxProvider, StaticFxRateProvider,
+    TriangulatingFxProvider,
+};
 pub use historical_price::{HistoricalPriceProvider, StaticHistoricalPriceProvider};
 pub use ids::{InstrumentId, LotId, PortfolioId, TransactionId, UserId};
 pub use instrument::{Instrument, InstrumentKind};

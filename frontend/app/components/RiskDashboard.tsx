@@ -47,6 +47,7 @@ interface Tip {
 
 function buildTip(v: DerivedView, conf: Confidence, h: HoverState): Tip | null {
   const { i, w, py, cx } = h;
+  const bc = v.baseCcy;
   const tot = v.tot;
   const pctOf = (x: number) => (x / tot) * 100;
 
@@ -70,7 +71,7 @@ function buildTip(v: DerivedView, conf: Confidence, h: HoverState): Tip | null {
       title,
       titleColor: tc,
       rows: [
-        { k: "P&L", v: comp(low) + " … " + comp(high), c: "#e8eaf0" },
+        { k: "P&L", v: comp(low, bc) + " … " + comp(high, bc), c: "#e8eaf0" },
         {
           k: "% of book",
           v: pctOf(low).toFixed(2) + "% … " + pctOf(high).toFixed(2) + "%",
@@ -91,14 +92,14 @@ function buildTip(v: DerivedView, conf: Confidence, h: HoverState): Tip | null {
         {
           k: "VaR 1-Day",
           v:
-            MINUS + comp((v1d[i] / 100) * tot) + " · " + MINUS +
+            MINUS + comp((v1d[i] / 100) * tot, bc) + " · " + MINUS +
             v1d[i].toFixed(2) + "%",
           c: "var(--accent)",
         },
         {
           k: "VaR 20-Day",
           v:
-            MINUS + comp((v20d[i] / 100) * tot) + " · " + MINUS +
+            MINUS + comp((v20d[i] / 100) * tot, bc) + " · " + MINUS +
             v20d[i].toFixed(2) + "%",
           c: "var(--loss)",
         },
@@ -117,7 +118,7 @@ function buildTip(v: DerivedView, conf: Confidence, h: HoverState): Tip | null {
       { k: "Drawdown", v: d.toFixed(2) + "%", c: "var(--loss)" },
       {
         k: "Depth",
-        v: MINUS + comp((Math.abs(d) / 100) * tot),
+        v: MINUS + comp((Math.abs(d) / 100) * tot, bc),
         c: "var(--loss)",
       },
     ],
@@ -463,6 +464,7 @@ export default function RiskDashboard({
                   </div>
                   <div style={{ position: "relative", marginTop: 12 }}>
                     <PnlDistributionChart
+                      baseCcy={view.baseCcy}
                       binLow={view.dist.binLow}
                       binHigh={view.dist.binHigh}
                       binCount={view.dist.binCount}

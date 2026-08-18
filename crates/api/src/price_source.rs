@@ -11,7 +11,8 @@ use arrow::record_batch::RecordBatch;
 use chrono::{Duration, NaiveDate};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use ptf_engine::{
-    Currency, InstrumentId, Money, StaticFxRateProvider, StaticHistoricalPriceProvider,
+    HistoricalFxProvider,
+    Currency, InstrumentId, Money, StaticHistoricalPriceProvider,
     StaticPriceProvider,
 };
 use rust_decimal::Decimal;
@@ -25,11 +26,23 @@ pub struct HeldInstrument {
     pub currency: Currency,
 }
 
-/// The three providers `compute_var` / `valuation` require, fully populated.
+/// The providers `compute_var` / `valuation` require, fully populated.
+///
+/// Two FX views, because the price history is remapped onto consecutive
+/// calendar days ending at `as_of` (see [`ParquetPriceSource`]):
+///
+/// - `fx` is keyed by those same remapped days, so it lines up with
+///   `historical` for equity-curve and VaR math.
+/// - `fx_trade_date` is keyed by real calendar dates, for converting a tax
+///   lot's cost at the rate that actually applied on its trade date.
+///
+/// Using `fx` for lot conversion (or `fx_trade_date` for the curve) would
+/// silently mis-date the rate, so they are deliberately separate fields.
 pub struct PriceData {
     pub historical: StaticHistoricalPriceProvider,
     pub prices: StaticPriceProvider,
-    pub fx: StaticFxRateProvider,
+    pub fx: HistoricalFxProvider,
+    pub fx_trade_date: HistoricalFxProvider,
 }
 
 /// Supplies price/FX data for a set of holdings as of a date.
@@ -70,15 +83,18 @@ impl PriceSource for SyntheticPriceSource {
     ) -> Result<PriceData, ApiError> {
         let mut historical = StaticHistoricalPriceProvider::new();
         let mut prices = StaticPriceProvider::new();
-        let mut fx = StaticFxRateProvider::new();
+        let mut fx = HistoricalFxProvider::new();
 
-        // FX: every supported currency → base, on as_of (identity handled by trait).
+        // FX: every supported currency → base, flat across the window. The
+        // synthetic feed has no FX path; forward-fill from the window start
+        // makes every date in range resolvable.
+        let start = as_of - Duration::days(i64::from(lookback_days) + 3650);
         let base_usd = usd_per(base);
         for code in SUPPORTED {
             if let Ok(from) = Currency::try_from(code) {
                 if from != base {
                     let rate = usd_per(from) / base_usd;
-                    fx.insert(from, base, as_of, dec(rate));
+                    fx.insert(from, base, start, dec(rate));
                 }
             }
         }
@@ -106,7 +122,8 @@ impl PriceSource for SyntheticPriceSource {
         Ok(PriceData {
             historical,
             prices,
-            fx,
+            fx: fx.clone(),
+            fx_trade_date: fx,
         })
     }
 }
@@ -138,24 +155,58 @@ impl PriceSource for ParquetPriceSource {
         lookback_days: u32,
     ) -> Result<PriceData, ApiError> {
         let closes = read_prices(&self.prices_path)?;
-        let fxmap = read_fx(&self.fx_path).unwrap_or_default();
+        let fxmap = read_fx(&self.fx_path)?;
 
         let mut historical = StaticHistoricalPriceProvider::new();
         let mut prices = StaticPriceProvider::new();
-        let mut fx = StaticFxRateProvider::new();
+        let mut fx = HistoricalFxProvider::new();
+        let mut fx_trade_date = HistoricalFxProvider::new();
 
-        // FX → base for every supported currency, crossed via USD.
-        let usd_of = |c: Currency| fxmap.get(c.as_str()).copied().unwrap_or_else(|| usd_per(c));
-        let base_usd = usd_of(base);
-        for code in SUPPORTED {
-            if let Ok(from) = Currency::try_from(code) {
-                if from != base {
-                    fx.insert(from, base, as_of, dec(usd_of(from) / base_usd));
+        let need = lookback_days as usize + 1;
+
+        // Every currency actually in play. A missing series is a hard error
+        // rather than a hardcoded guess: valuing a book at an invented rate is
+        // wrong in a way nobody can see downstream.
+        let mut needed: Vec<Currency> = holdings.iter().map(|h| h.currency).collect();
+        needed.push(base);
+        needed.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        needed.dedup();
+        for c in &needed {
+            if !fxmap.contains_key(c.as_str()) {
+                return Err(ApiError::BadRequest(format!(
+                    "no FX data for {c} — run the prices service to refresh fx.parquet"
+                )));
+            }
+        }
+
+        let base_series: &[(NaiveDate, f64)] = &fxmap[base.as_str()];
+
+        for c in &needed {
+            if *c == base {
+                continue; // identity, handled by the trait
+            }
+            let series = &fxmap[c.as_str()];
+
+            // True-dated view, for converting a lot at its own trade date.
+            for &(d, usd) in series {
+                if let Some(b) = lookup(base_series, d) {
+                    fx_trade_date.insert(*c, base, d, dec(usd / b));
+                }
+            }
+
+            // Remapped view, aligned with the price history's synthetic
+            // calendar days so the equity curve joins FX correctly.
+            let take = series.len().min(need);
+            let recent = &series[series.len() - take..];
+            let k = recent.len();
+            for (i, &(d, usd)) in recent.iter().enumerate() {
+                let offset = i64::try_from(k - 1 - i).unwrap_or(0);
+                if let Some(b) = lookup(base_series, d) {
+                    fx.insert(*c, base, as_of - Duration::days(offset), dec(usd / b));
                 }
             }
         }
 
-        let need = lookback_days as usize + 1;
         for h in holdings {
             let series = closes.get(&h.symbol).ok_or_else(|| {
                 ApiError::BadRequest(format!(
@@ -180,6 +231,7 @@ impl PriceSource for ParquetPriceSource {
             historical,
             prices,
             fx,
+            fx_trade_date,
         })
     }
 }
@@ -205,19 +257,37 @@ fn read_prices(path: &Path) -> Result<HashMap<String, Vec<f64>>, ApiError> {
     Ok(map)
 }
 
-fn read_fx(path: &Path) -> Result<HashMap<String, f64>, ApiError> {
-    let file = File::open(path).map_err(|e| ApiError::Internal(e.to_string()))?;
+/// Most recent rate on or before `date` in a date-sorted series.
+fn lookup(series: &[(NaiveDate, f64)], date: NaiveDate) -> Option<f64> {
+    let i = series.partition_point(|(d, _)| *d <= date);
+    (i > 0).then(|| series[i - 1].1)
+}
+
+/// USD-per-unit series per currency, ascending by date.
+fn read_fx(path: &Path) -> Result<HashMap<String, Vec<(NaiveDate, f64)>>, ApiError> {
+    let file = File::open(path).map_err(|_| {
+        ApiError::BadRequest("FX data unavailable — run the prices service to fetch rates".into())
+    })?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .and_then(ParquetRecordBatchReaderBuilder::build)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let mut map = HashMap::new();
+    let mut map: HashMap<String, Vec<(NaiveDate, f64)>> = HashMap::new();
     for batch in reader {
         let batch = batch.map_err(|e| ApiError::Internal(e.to_string()))?;
         let ccy = col_str(&batch, "ccy")?;
+        let date = col_str(&batch, "date")?;
         let usd = col_f64(&batch, "usd_per_unit")?;
         for i in 0..batch.num_rows() {
-            map.insert(ccy.value(i).to_string(), usd.value(i));
+            let Ok(d) = NaiveDate::parse_from_str(date.value(i), "%Y-%m-%d") else {
+                continue;
+            };
+            map.entry(ccy.value(i).to_string())
+                .or_default()
+                .push((d, usd.value(i)));
         }
+    }
+    for series in map.values_mut() {
+        series.sort_by_key(|(d, _)| *d);
     }
     Ok(map)
 }

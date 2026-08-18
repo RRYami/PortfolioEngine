@@ -14,35 +14,23 @@ import {
   type SortingState,
 } from "@tanstack/react-table";
 import type { PositionDetail } from "@/app/lib/positionsTypes";
-import { comp, MINUS, nf } from "@/app/lib/format";
+import { ccySym, comp, MINUS, nf } from "@/app/lib/format";
 
 const GAIN = "var(--gain)";
 const LOSS = "var(--loss)";
-
-function ccySym(ccy: string): string {
-  switch (ccy) {
-    case "EUR":
-      return "€";
-    case "GBP":
-      return "£";
-    case "JPY":
-      return "¥";
-    case "CHF":
-      return "₣";
-    default:
-      return "$";
-  }
-}
 
 /** Native-currency money, e.g. `$64.50`. */
 function money(n: number, ccy: string, d = 2): string {
   return ccySym(ccy) + nf(n, d);
 }
 
-/** Signed base-currency P&L using the compact `$1.2k` formatter. */
-function signedComp(n: number): string {
-  return (n >= 0 ? "+" : MINUS) + comp(Math.abs(n));
+/** Signed compact money, e.g. `+€1.2k`. */
+function signedComp(n: number, ccy: string): string {
+  return (n >= 0 ? "+" : MINUS) + comp(Math.abs(n), ccy);
 }
+
+/** Muted second line under a base-currency figure, showing the native one. */
+const subLine: CSSProperties = { fontSize: 10, color: "#6b7280", marginTop: 1 };
 
 const th: CSSProperties = {
   padding: "9px 12px",
@@ -60,8 +48,11 @@ const col = createColumnHelper<PositionDetail>();
 
 export default function PositionsTable({
   positions,
+  baseCcy,
 }: {
   positions: PositionDetail[];
+  /** Portfolio base currency — every converted figure is rendered in it. */
+  baseCcy: string;
 }) {
   const [sorting, setSorting] = useState<SortingState>([
     { id: "marketValue", desc: true },
@@ -156,11 +147,21 @@ export default function PositionsTable({
       }),
       col.accessor("marketValue", {
         header: "Mkt Value",
-        cell: (c) => (
-          <span className="mono" style={{ color: "#e8eaf0" }}>
-            {comp(c.getValue())}
-          </span>
-        ),
+        cell: (c) => {
+          const p = c.row.original;
+          return (
+            <div>
+              <div className="mono" style={{ color: "#e8eaf0" }}>
+                {comp(c.getValue(), baseCcy)}
+              </div>
+              {p.ccy !== baseCcy && (
+                <div className="mono" style={subLine}>
+                  {money(p.marketValueNative, p.ccy, 0)}
+                </div>
+              )}
+            </div>
+          );
+        },
       }),
       col.accessor("weightPct", {
         header: "Weight",
@@ -200,19 +201,24 @@ export default function PositionsTable({
           return (
             <div>
               <div className="mono" style={{ color }}>
-                {signedComp(c.getValue())}
+                {signedComp(c.getValue(), baseCcy)}
               </div>
               <div className="mono" style={{ color, fontSize: 10, opacity: 0.8 }}>
                 {(p.unrealizedPnlPct >= 0 ? "+" : MINUS) +
                   Math.abs(p.unrealizedPnlPct).toFixed(1) +
                   "%"}
               </div>
+              {p.ccy !== baseCcy && (
+                <div className="mono" style={subLine}>
+                  {signedComp(p.unrealizedPnlNative, p.ccy)}
+                </div>
+              )}
             </div>
           );
         },
       }),
     ],
-    [],
+    [baseCcy],
   );
 
   const table = useReactTable({
@@ -333,7 +339,7 @@ export default function PositionsTable({
                 {row.getIsExpanded() && (
                   <tr>
                     <td colSpan={colCount} style={{ padding: 0 }}>
-                      <LotsPanel position={row.original} />
+                      <LotsPanel position={row.original} baseCcy={baseCcy} />
                     </td>
                   </tr>
                 )}
@@ -415,8 +421,16 @@ function PagerButton({
 }
 
 /** Drill-in: the individual tax lots behind a position. */
-function LotsPanel({ position }: { position: PositionDetail }) {
+function LotsPanel({
+  position,
+  baseCcy,
+}: {
+  position: PositionDetail;
+  baseCcy: string;
+}) {
   const sym = ccySym(position.ccy);
+  // Only worth showing the conversion when there is one to show.
+  const converted = position.ccy !== baseCcy;
   return (
     <div
       style={{
@@ -435,6 +449,16 @@ function LotsPanel({ position }: { position: PositionDetail }) {
             <th style={{ textAlign: "right", padding: "4px 8px" }}>Quantity</th>
             <th style={{ textAlign: "right", padding: "4px 8px" }}>Price</th>
             <th style={{ textAlign: "right", padding: "4px 8px" }}>Cost</th>
+            {converted && (
+              <>
+                <th style={{ textAlign: "right", padding: "4px 8px" }}>
+                  Trade-date FX
+                </th>
+                <th style={{ textAlign: "right", padding: "4px 8px" }}>
+                  Cost ({baseCcy})
+                </th>
+              </>
+            )}
           </tr>
         </thead>
         <tbody>
@@ -461,6 +485,22 @@ function LotsPanel({ position }: { position: PositionDetail }) {
               >
                 {sym + nf(lot.cost, 2)}
               </td>
+              {converted && (
+                <>
+                  <td
+                    className="mono"
+                    style={{ padding: "5px 8px", textAlign: "right", color: "#9aa1b2" }}
+                  >
+                    {nf(lot.fxRate, 4)}
+                  </td>
+                  <td
+                    className="mono"
+                    style={{ padding: "5px 8px", textAlign: "right", color: "#e8eaf0" }}
+                  >
+                    {ccySym(baseCcy) + nf(lot.costBase, 2)}
+                  </td>
+                </>
+              )}
             </tr>
           ))}
         </tbody>

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
@@ -89,6 +89,69 @@ impl FxRateProvider for StaticFxRateProvider {
         self.rates
             .get(&(from, to, date))
             .copied()
+            .ok_or(FxError::RateUnavailable { from, to, date })
+    }
+}
+
+/// In-memory FX provider over a **dated series**, resolving a date to the most
+/// recent rate on or before it.
+///
+/// Unlike [`StaticFxRateProvider`], which matches dates exactly, this carries
+/// one sorted series per currency pair and forward-fills. FX and equity
+/// trading calendars diverge (different market holidays), so an exact-date
+/// lookup would spuriously fail on days a venue was open but the FX source was
+/// not. Forward-filling the last known rate is the standard convention.
+///
+/// A lookup *before* the first point of a series is [`FxError::RateUnavailable`]
+/// rather than a back-fill: valuing a trade at a rate that did not yet exist in
+/// the data is a silent lie, and the caller should be told the history is short.
+#[derive(Debug, Clone, Default)]
+pub struct HistoricalFxProvider {
+    series: HashMap<(Currency, Currency), BTreeMap<NaiveDate, Decimal>>,
+}
+
+impl HistoricalFxProvider {
+    pub fn new() -> Self {
+        Self {
+            series: HashMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, from: Currency, to: Currency, date: NaiveDate, rate: Decimal) {
+        self.series.entry((from, to)).or_default().insert(date, rate);
+    }
+
+    #[must_use]
+    pub fn with_rate(
+        mut self,
+        from: Currency,
+        to: Currency,
+        date: NaiveDate,
+        rate: Decimal,
+    ) -> Self {
+        self.insert(from, to, date, rate);
+        self
+    }
+
+    /// Earliest date covered for a pair, if any — lets callers report how far
+    /// back conversion is actually possible.
+    #[must_use]
+    pub fn earliest(&self, from: Currency, to: Currency) -> Option<NaiveDate> {
+        self.series.get(&(from, to))?.keys().next().copied()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.series.is_empty()
+    }
+}
+
+impl FxRateProvider for HistoricalFxProvider {
+    fn rate_impl(&self, from: Currency, to: Currency, date: NaiveDate) -> Result<Decimal, FxError> {
+        self.series
+            .get(&(from, to))
+            .and_then(|s| s.range(..=date).next_back())
+            .map(|(_, rate)| *rate)
             .ok_or(FxError::RateUnavailable { from, to, date })
     }
 }
@@ -202,6 +265,75 @@ mod tests {
 
     fn date(day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(2024, 1, day).unwrap()
+    }
+
+    // ── HistoricalFxProvider ────────────────────────────────────────────────
+
+    fn hist() -> HistoricalFxProvider {
+        HistoricalFxProvider::new()
+            .with_rate(Currency::USD, Currency::EUR, date(5), Decimal::new(90, 2))
+            .with_rate(Currency::USD, Currency::EUR, date(10), Decimal::new(85, 2))
+    }
+
+    #[test]
+    fn historical_exact_date_hit() {
+        assert_eq!(
+            hist().rate(Currency::USD, Currency::EUR, date(10)).unwrap(),
+            Decimal::new(85, 2)
+        );
+    }
+
+    #[test]
+    fn historical_forward_fills_between_points() {
+        // A day the FX source did not publish resolves to the last known rate.
+        assert_eq!(
+            hist().rate(Currency::USD, Currency::EUR, date(7)).unwrap(),
+            Decimal::new(90, 2)
+        );
+    }
+
+    #[test]
+    fn historical_forward_fills_past_last_point() {
+        assert_eq!(
+            hist().rate(Currency::USD, Currency::EUR, date(31)).unwrap(),
+            Decimal::new(85, 2)
+        );
+    }
+
+    #[test]
+    fn historical_before_first_point_is_unavailable() {
+        // Deliberately not back-filled: a lot older than the FX history must
+        // be reported, not valued at a rate that did not exist in the data.
+        assert!(matches!(
+            hist().rate(Currency::USD, Currency::EUR, date(1)),
+            Err(FxError::RateUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn historical_identity_needs_no_data() {
+        let fx = HistoricalFxProvider::new();
+        assert_eq!(
+            fx.rate(Currency::USD, Currency::USD, date(1)).unwrap(),
+            Decimal::ONE
+        );
+    }
+
+    #[test]
+    fn historical_unknown_pair_is_unavailable() {
+        assert!(matches!(
+            hist().rate(Currency::GBP, Currency::JPY, date(10)),
+            Err(FxError::RateUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn historical_earliest_reports_coverage_start() {
+        assert_eq!(
+            hist().earliest(Currency::USD, Currency::EUR),
+            Some(date(5))
+        );
+        assert_eq!(hist().earliest(Currency::GBP, Currency::JPY), None);
     }
 
     // ── StaticFxRateProvider ────────────────────────────────────────────────

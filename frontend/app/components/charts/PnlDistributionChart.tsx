@@ -19,6 +19,8 @@ const PLOT_H = 208;
 export const PNL_DIST_H = PLOT_H + M.top + M.bottom;
 
 export interface PnlDistributionChartProps {
+  /** Base currency, for the P&L axis labels. */
+  baseCcy: string;
   binLow: number;
   binHigh: number;
   binCount: number;
@@ -35,6 +37,7 @@ export interface PnlDistributionChartProps {
 }
 
 export default function PnlDistributionChart({
+  baseCcy,
   binLow,
   binHigh,
   binCount,
@@ -142,7 +145,7 @@ export default function PnlDistributionChart({
         d3
           .axisBottom(x)
           .ticks(xTickCount(innerW))
-          .tickFormat((v) => comp(Number(v)))
+          .tickFormat((v) => comp(Number(v), baseCcy))
           .tickSizeOuter(0) as unknown as (sel: Sel) => void,
       );
     ensure(g, "g", "y-axis d3-axis").call(
@@ -185,6 +188,7 @@ export default function PnlDistributionChart({
     deepV,
     width,
     innerW,
+    baseCcy,
   ]);
 
   useEffect(() => {

@@ -6,7 +6,7 @@
 // paths at render time from these raw numbers, so this module only formats.
 
 import type { Confidence, RiskPayload } from "./riskTypes";
-import { asOfLabel, comp, MINUS, nf } from "./format";
+import { asOfLabel, ccySym, comp, MINUS, nf } from "./format";
 
 const GAIN = "var(--gain)";
 const LOSS = "var(--loss)";
@@ -38,6 +38,8 @@ export interface CompRow {
 }
 
 export interface DerivedView {
+  /** Portfolio base currency — every converted figure is rendered in it. */
+  baseCcy: string;
   confL: string;
   asOf: string;
   tot: number;
@@ -79,6 +81,7 @@ const round1 = (n: number) => Number(n.toFixed(1));
 
 export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
   const tot = payload.portfolioValue;
+  const bc = payload.baseCcy;
   const confL = `${conf}%`;
   const r = payload.risk[conf];
 
@@ -92,28 +95,28 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
   const kpis: Kpi[] = [
     {
       label: "Portfolio Value",
-      value: comp(tot),
+      value: comp(tot, bc),
       valueColor: "#f5f7fb",
       sub: `▲ ${payload.todayReturnPct.toFixed(1)}% today`,
       subColor: GAIN,
     },
     {
       label: "VaR · 1-Day",
-      value: comp(-r.var1d),
+      value: comp(-r.var1d, bc),
       valueColor: LOSS,
       sub: `${var1dPctS} · ${confL}`,
       subColor: LOSS,
     },
     {
       label: "VaR · 20-Day",
-      value: comp(-r.var20d),
+      value: comp(-r.var20d, bc),
       valueColor: LOSS,
       sub: `${var20dPctS} · ${confL}`,
       subColor: LOSS,
     },
     {
       label: "Exp. Shortfall",
-      value: comp(-r.es1d),
+      value: comp(-r.es1d, bc),
       valueColor: LOSS,
       sub: `${es1dPctS} · ${confL}`,
       subColor: LOSS,
@@ -136,7 +139,7 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
       label: "Unrealized P&L",
       value:
         (payload.unrealizedPnl >= 0 ? "+" : MINUS) +
-        comp(Math.abs(payload.unrealizedPnl)),
+        comp(Math.abs(payload.unrealizedPnl), bc),
       valueColor: payload.unrealizedPnl >= 0 ? GAIN : LOSS,
       sub: "on cost basis",
       subColor: "#6b7280",
@@ -148,12 +151,13 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
     t: p.ticker,
     name: p.name,
     ccy: p.ccy,
-    lastL: (p.ccy === "EUR" ? "€" : "$") + nf(p.last, 2),
-    mvL: comp(p.marketValue),
+    // `last` is a native-currency quote; `unrealizedPnl` is already in base.
+    lastL: ccySym(p.ccy) + nf(p.last, 2),
+    mvL: comp(p.marketValue, bc),
     wtPct: p.weightPct,
     upnlL:
       (p.unrealizedPnl >= 0 ? "+" : MINUS) +
-      "$" +
+      ccySym(bc) +
       nf(Math.abs(p.unrealizedPnl), 0),
     upnlColor: p.unrealizedPnl >= 0 ? GAIN : LOSS,
   }));
@@ -162,7 +166,7 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
   const maxValue = r.componentVar[0]?.value ?? 1;
   const comps: CompRow[] = r.componentVar.map((c) => ({
     t: c.ticker,
-    valueL: comp(c.value),
+    valueL: comp(c.value, bc),
     pctL: c.pctOfVar + "%",
     barPct: round1((c.value / maxValue) * 100),
   }));
@@ -173,8 +177,8 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
   const bw = (hi - lo) / nb;
   const cut = payload.pnlDistribution.cutoffs[conf];
 
-  const var1dBoth = comp(-r.var1d) + " (" + var1dPctS + ")";
-  const es1dBoth = comp(-r.es1d) + " (" + es1dPctS + ")";
+  const var1dBoth = comp(-r.var1d, bc) + " (" + var1dPctS + ")";
+  const es1dBoth = comp(-r.es1d, bc) + " (" + es1dPctS + ")";
 
   // ---- Drawdown underwater curve ----
   const ddSeries = payload.drawdown.series; // % from peak, ≤ 0
@@ -188,6 +192,7 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
   const cur20dPct = v20d.at(-1) ?? 0;
 
   return {
+    baseCcy: bc,
     confL,
     asOf: asOfLabel(payload.asOf),
     tot,
@@ -214,10 +219,10 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
     },
     histVar: {
       cur1d:
-        MINUS + comp((cur1dPct / 100) * tot) + " · " + MINUS +
+        MINUS + comp((cur1dPct / 100) * tot, bc) + " · " + MINUS +
         cur1dPct.toFixed(2) + "%",
       cur20d:
-        MINUS + comp((cur20dPct / 100) * tot) + " · " + MINUS +
+        MINUS + comp((cur20dPct / 100) * tot, bc) + " · " + MINUS +
         cur20dPct.toFixed(2) + "%",
       v1d,
       v20d,

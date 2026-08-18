@@ -34,13 +34,29 @@ pub struct PositionDetail {
     pub avg_cost: f64,
     /// Latest spot price, native currency.
     pub last: f64,
-    /// Market value in base currency.
+    /// Market value in base currency, at the spot rate.
     pub market_value: f64,
-    /// Cost basis in base currency.
+    /// Market value in the position's own currency.
+    pub market_value_native: f64,
+    /// Cost basis in base currency, each lot converted at **its own trade-date
+    /// rate** — so the base return includes the FX leg the investor actually
+    /// experienced.
     pub cost_basis: f64,
+    /// Cost basis in the position's own currency.
+    pub cost_basis_native: f64,
     pub weight_pct: f64,
+    /// Total unrealized P&L in base currency (`price` + `fx` components).
     pub unrealized_pnl: f64,
+    /// Unrealized P&L in the position's own currency — the pure price move.
+    pub unrealized_pnl_native: f64,
+    /// The price move, expressed in base at today's rate.
+    pub unrealized_pnl_price: f64,
+    /// The currency move: what the base return gains or loses purely because
+    /// the rate changed between each lot's trade date and today.
+    pub unrealized_pnl_fx: f64,
     pub unrealized_pnl_pct: f64,
+    /// Spot rate used for market value, native → base.
+    pub fx_rate: f64,
     /// Individual open long lots behind this position.
     pub lots: Vec<LotView>,
 }
@@ -54,6 +70,10 @@ pub struct LotView {
     pub price: f64,
     /// `quantity * price`, native currency.
     pub cost: f64,
+    /// Native → base rate on this lot's trade date.
+    pub fx_rate: f64,
+    /// `cost` converted at that trade-date rate.
+    pub cost_base: f64,
 }
 
 fn f(x: rust_decimal::Decimal) -> f64 {
@@ -81,9 +101,8 @@ pub fn build(
         let price = f(pd.prices.price(*inst_id, as_of)?.amount);
         let fx = f(pd.fx.rate(ccy, base, as_of)?);
         let cost_native = f(pos.long_cost_basis().amount);
-        let mv_base = qty * price * fx;
-        let cost_base = cost_native * fx;
-        let upnl_base = mv_base - cost_base;
+        let mv_native = qty * price;
+        let mv_base = mv_native * fx;
         total_mv += mv_base;
 
         let ticker = meta.map_or_else(|| inst_id.0.to_string(), |m| m.symbol.clone());
@@ -92,19 +111,33 @@ pub fn build(
             .cloned()
             .unwrap_or_else(|| ticker.clone());
 
-        let lots: Vec<LotView> = pos
-            .long_lots()
-            .map(|lot| {
-                let lq = f(lot.quantity());
-                let lp = f(lot.basis_per_unit().amount);
-                LotView {
-                    date: lot.open_date().format("%Y-%m-%d").to_string(),
-                    quantity: lq,
-                    price: lp,
-                    cost: lq * lp,
-                }
-            })
-            .collect();
+        // Each lot converts at the rate on *its* trade date, so a book held
+        // across an FX move shows the return its owner actually earned.
+        let mut cost_base = 0.0;
+        let mut lots: Vec<LotView> = Vec::new();
+        for lot in pos.long_lots() {
+            let lq = f(lot.quantity());
+            let lp = f(lot.basis_per_unit().amount);
+            let open = lot.open_date();
+            let lot_fx = f(pd.fx_trade_date.rate(ccy, base, open)?);
+            let cost = lq * lp;
+            cost_base += cost * lot_fx;
+            lots.push(LotView {
+                date: open.format("%Y-%m-%d").to_string(),
+                quantity: lq,
+                price: lp,
+                cost,
+                fx_rate: lot_fx,
+                cost_base: cost * lot_fx,
+            });
+        }
+
+        let upnl_native = mv_native - cost_native;
+        let upnl_base = mv_base - cost_base;
+        // Split the base P&L: the price leg is the native move carried over at
+        // today's rate; the rest is what the currency did.
+        let upnl_price = upnl_native * fx;
+        let upnl_fx = upnl_base - upnl_price;
 
         rows.push(PositionDetail {
             ticker,
@@ -114,14 +147,20 @@ pub fn build(
             avg_cost: if qty == 0.0 { 0.0 } else { cost_native / qty },
             last: price,
             market_value: mv_base,
+            market_value_native: mv_native,
             cost_basis: cost_base,
+            cost_basis_native: cost_native,
             weight_pct: 0.0, // filled below
             unrealized_pnl: upnl_base,
+            unrealized_pnl_native: upnl_native,
+            unrealized_pnl_price: upnl_price,
+            unrealized_pnl_fx: upnl_fx,
             unrealized_pnl_pct: if cost_base == 0.0 {
                 0.0
             } else {
                 upnl_base / cost_base * 100.0
             },
+            fx_rate: fx,
             lots,
         });
     }
