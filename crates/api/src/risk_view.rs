@@ -38,7 +38,9 @@ pub struct RiskPayload {
     pub portfolio_value: f64,
     pub realized_pnl: f64,
     pub unrealized_pnl: f64,
-    pub today_return_pct: f64,
+    /// Today's move on the current book, in percent. `None` when the window
+    /// has fewer than two points to compare.
+    pub today_return_pct: Option<f64>,
     pub ann_vol_pct: f64,
     pub positions: Vec<PositionRow>,
     pub drawdown: Drawdown,
@@ -230,6 +232,15 @@ pub fn build(
     let (equity, date_vec) =
         equity::series(state, pd, base, as_of, cfg.lookback_days, Some(CHART_DAYS))?;
     let dates = equity::iso(&date_vec);
+    // Today's move, from the last two points of that same curve. This is the
+    // *current* book's move (the curve values today's holdings backwards), not
+    // the return of the book as it stood yesterday; they differ if you traded
+    // today. `None` rather than 0.0 when there is nothing to compare against —
+    // a genuinely flat day and an uncomputable one must not look identical.
+    let today_return_pct = match equity.as_slice() {
+        [.., prev, last] if *prev != 0.0 => Some((last / prev - 1.0) * 100.0),
+        _ => None,
+    };
     let drawdown = charts::drawdown(&equity, &dates);
     let hist_var = charts::historical_var(&equity, &dates, total, var1d95, var1d99);
 
@@ -239,7 +250,7 @@ pub fn build(
         portfolio_value: total,
         realized_pnl,
         unrealized_pnl,
-        today_return_pct: 0.0,
+        today_return_pct,
         ann_vol_pct,
         positions: rows,
         drawdown,

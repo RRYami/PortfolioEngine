@@ -83,6 +83,7 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
   const tot = payload.portfolioValue;
   const bc = payload.baseCcy;
   const confL = `${conf}%`;
+  const today = payload.todayReturnPct;
   const r = payload.risk[conf];
 
   const pctS = (x: number) =>
@@ -97,8 +98,13 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
       label: "Portfolio Value",
       value: comp(tot, bc),
       valueColor: "#f5f7fb",
-      sub: `▲ ${payload.todayReturnPct.toFixed(1)}% today`,
-      subColor: GAIN,
+      // Arrow and colour follow the sign; a null (nothing to compare against)
+      // shows a dash rather than a flat 0.0%, which would read as a real move.
+      sub:
+        today == null
+          ? "— today"
+          : `${today >= 0 ? "▲" : "▼"} ${nf(Math.abs(today), 1)}% today`,
+      subColor: today == null ? "#6b7280" : today >= 0 ? GAIN : LOSS,
     },
     {
       label: "VaR · 1-Day",

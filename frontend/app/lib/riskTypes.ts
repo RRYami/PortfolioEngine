@@ -85,7 +85,8 @@ export interface RiskPayload {
   portfolioValue: number;
   realizedPnl: number;
   unrealizedPnl: number;
-  todayReturnPct: number;
+  /** Today's move on the current book; null when not computable. */
+  todayReturnPct: number | null;
   /** 252-day realized, annualized %. */
   annVolPct: number;
   positions: Position[];
