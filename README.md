@@ -116,7 +116,9 @@ ptf_engine/
   Cargo.lock              # workspace lockfile
   docker-compose.yml      # TimescaleDB (timescale/timescaledb:2.17.2-pg16) on port 5433
   Makefile                # db-up, db-down, db-reset, test, etc.
-  .env                    # DATABASE_URL for local dev
+  .env.example            # template; cp .env.example .env for local dev
+  .env                    # DATABASE_URL for local dev (gitignored)
+  .env.local              # local secrets, e.g. DATABENTO_API_KEY (gitignored)
   crates/
     engine/               # domain crate (ptf-engine)
       src/
