@@ -10,3 +10,8 @@ dependencies = [
     "duckdb>=1.0",
     "pandas>=2.2",
 ]
+
+[project.optional-dependencies]
+# Only the standalone options backfill needs this; the service image does not
+# install it (see Dockerfile).
+options = ["databento>=0.34"]
