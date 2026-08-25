@@ -23,6 +23,7 @@ pub mod risk;
 pub mod transaction;
 pub mod user;
 pub mod valuation;
+pub mod vol;
 
 pub use currency::Currency;
 pub use error::DomainError;
@@ -49,6 +50,7 @@ pub use risk::{AssetRisk, MonteCarloConfig, RiskError, VaREntry, VaRReport, comp
 pub use transaction::{CorporateAction, Transaction, TransactionKind};
 pub use user::User;
 pub use valuation::ValuationError;
+pub use vol::{OptionRight, VOL_RESOLUTION, VolError, implied_vol};
 
 #[cfg(any(test, feature = "in-memory-repo"))]
 pub use repository::memory::{

@@ -2154,6 +2154,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "libm",
  "proptest",
  "rand 0.8.6",
  "rand_distr",

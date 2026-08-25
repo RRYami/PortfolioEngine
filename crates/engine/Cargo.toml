@@ -21,6 +21,9 @@ serde = { workspace = true, optional = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, optional = true }
 rand = "0.8"
+# Normal CDF via erfc; std has no erf, and the deep wings of an option chain
+# need the tail accuracy a hand-rolled approximation would not give.
+libm = "0.2"
 rand_distr = "0.4"
 
 [dev-dependencies]
