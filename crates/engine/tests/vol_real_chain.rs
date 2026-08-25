@@ -47,7 +47,7 @@ fn real_chain_produces_a_believable_smile() {
         match implied_vol(right, mid, FORWARD, strike, TTE, DF) {
             Ok(v) => {
                 let k = (strike / FORWARD).ln();
-                println!("{right} K={strike:7.1} k={k:+.4} mid={mid:8.4} iv={:.4}", v);
+                println!("{right} K={strike:7.1} k={k:+.4} mid={mid:8.4} iv={v:.4}");
                 pts.push((k, v));
             }
             // Far wings may not constrain a vol; that is a legitimate outcome.
@@ -66,7 +66,7 @@ fn real_chain_produces_a_believable_smile() {
     let dn: Vec<f64> = pts.iter().filter(|(k, _)| *k < -0.08).map(|(_, v)| *v).collect();
     let up: Vec<f64> = pts.iter().filter(|(k, _)| *k > 0.08).map(|(_, v)| *v).collect();
     assert!(!dn.is_empty() && !up.is_empty(), "need both wings");
-    let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
+    let mean = |xs: &[f64]| xs.iter().sum::<f64>() / f64::from(u32::try_from(xs.len()).unwrap());
     assert!(mean(&dn) > mean(&up),
         "expected negative skew, got puts {:.4} vs calls {:.4}", mean(&dn), mean(&up));
 

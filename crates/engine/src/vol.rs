@@ -343,7 +343,8 @@ mod tests {
     #[test]
     fn vega_matches_finite_difference() {
         let (k, t, v) = (520.0, 0.5, 0.31);
-        let h = 1e-6;
+        // See vol_properties.rs: too small a step is round-off dominated.
+        let h = 1e-5;
         let fd = (price(OptionRight::Call, F, k, t, v + h, DF)
             - price(OptionRight::Call, F, k, t, v - h, DF))
             / (2.0 * h);

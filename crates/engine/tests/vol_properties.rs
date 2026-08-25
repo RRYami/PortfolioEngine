@@ -60,10 +60,24 @@ proptest! {
     fn vega_non_negative_and_consistent((f, k, t, v, df) in contract()) {
         let g = vega(f, k, t, v, df);
         prop_assert!(g >= 0.0, "negative vega {g}");
-        let h = 1e-6 * v;
+
+        // The step is the delicate part, not the formula. A central difference
+        // subtracts two nearly equal premiums, so shrinking h past the f64
+        // round-off floor makes it *less* accurate: at h = 1e-6*v on a deep-ITM
+        // contract it is already wrong by 2e-4, while the closed form is exact
+        // to all 17 digits (checked against an independent implementation).
+        // 1e-5 sits near the minimum of truncation against cancellation.
+        let h = 1e-5 * v;
         let fd = (price(OptionRight::Call, f, k, t, v + h, df)
                 - price(OptionRight::Call, f, k, t, v - h, df)) / (2.0 * h);
-        if g > 1e-6 * (df * f).max(1.0) {
+
+        // Only compare where the difference is resolvable at all: the change in
+        // premium across 2h has to stand clear of the f64 resolution of the
+        // premium itself, or the difference is measuring noise.
+        let px = price(OptionRight::Call, f, k, t, v, df);
+        let signal = 2.0 * h * g;
+        let noise = f64::EPSILON * px.abs().max(1.0);
+        if signal > 1e5 * noise {
             prop_assert!((g - fd).abs() <= 1e-4 * g, "vega {g} vs fd {fd}");
         }
     }

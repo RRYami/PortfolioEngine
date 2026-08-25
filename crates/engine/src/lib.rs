@@ -6,6 +6,7 @@
 pub mod currency;
 pub mod error;
 pub mod fold;
+pub mod forward;
 pub mod fx;
 pub mod historical_price;
 pub mod ids;
@@ -28,6 +29,7 @@ pub mod vol;
 pub use currency::Currency;
 pub use error::DomainError;
 pub use fold::fold;
+pub use forward::{ForwardError, ImpliedForward, ParityPair, implied_forward};
 pub use fx::{
     FxError, FxRateProvider, HistoricalFxProvider, StaticFxRateProvider,
     TriangulatingFxProvider,
