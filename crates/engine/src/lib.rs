@@ -29,7 +29,9 @@ pub mod vol;
 pub use currency::Currency;
 pub use error::DomainError;
 pub use fold::fold;
-pub use forward::{ForwardError, ImpliedForward, ParityPair, implied_forward};
+pub use forward::{
+    DiscountCurve, ForwardError, ImpliedForward, ParityPair, forward_at, implied_forward,
+};
 pub use fx::{
     FxError, FxRateProvider, HistoricalFxProvider, StaticFxRateProvider,
     TriangulatingFxProvider,
