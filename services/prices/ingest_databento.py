@@ -23,9 +23,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import datetime as dt
 import os
 import sys
+import threading
+import time
+from collections import deque
 from zoneinfo import ZoneInfo
 
 import databento as db
@@ -49,7 +53,52 @@ SYMBOL_CHUNK = 1500                # max raw symbols per API request
 # "skipped" lines and leave an empty store looking like a calendar problem.
 MAX_CONSECUTIVE_ERRORS = 3
 
+# Sessions are independent and the loop is latency-bound (~6 round trips of
+# ~4-5s each), not bandwidth-bound, so concurrency buys close to a linear
+# speed-up. Kept modest to stay well inside Databento's rate limits.
+DEFAULT_WORKERS = 6
+
 ET = ZoneInfo("America/New_York")
+
+
+class BudgetExceeded(RuntimeError):
+    """Estimated spend passed --max-cost. Aborts the run rather than being
+    recorded as a per-date failure: the cap is a stop, not a bad session."""
+
+
+_budget_lock = threading.Lock()
+_local = threading.local()
+
+
+def client_for(key: str) -> db.Historical:
+    """One client per worker thread — the HTTP session underneath is not
+    documented as thread-safe, and a client is cheap."""
+    c = getattr(_local, "client", None)
+    if c is None:
+        c = _local.client = db.Historical(key)
+    return c
+
+
+def charge(budget: dict | None, amount: float) -> None:
+    if budget is None:
+        return
+    with _budget_lock:
+        budget["spent"] += 0.0 if amount != amount else amount   # NaN-safe
+        if budget["cap"] is not None and budget["spent"] > budget["cap"]:
+            raise BudgetExceeded(
+                f"estimated spend ${budget['spent']:.4f} exceeds --max-cost "
+                f"${budget['cap']:.4f}"
+            )
+
+
+def is_no_chain(exc: Exception) -> bool:
+    """A market holiday has no listed chain, but Databento reports that as a
+    422 on the parent symbol rather than an empty frame. Classifying it as a
+    failure would both mislabel the session and, because `done_dates` excludes
+    errors so they can be retried, park every holiday at the head of the next
+    run's todo list — where MAX_CONSECUTIVE_ERRORS aborts it before it reaches
+    real work."""
+    return "symbology_invalid_request" in str(exc)
 
 
 def parse_osi(raw_symbol: str) -> dict:
@@ -141,34 +190,33 @@ def fetch_definitions(client: db.Historical, root: str, date: dt.date) -> pd.Dat
 
 def fetch_day(
     client: db.Historical, root: str, date: dt.date, budget: dict | None = None
-) -> pd.DataFrame | None:
+) -> tuple[pd.DataFrame | None, str]:
     snap_start = dt.datetime.combine(date, SNAPSHOT_ET, tzinfo=ET)
     snap_end = snap_start + dt.timedelta(minutes=1)
 
     d_cost = definition_cost(client, root, date)
-    print(f"  {date} {root}: definitions ${d_cost:.6f}")
-    if budget is not None:
-        budget["spent"] += 0.0 if d_cost != d_cost else d_cost
+    charge(budget, d_cost)
 
     defs = fetch_definitions(client, root, date)
     if defs.empty:
-        return None
+        return None, "no definitions"
 
     keep = filter_chain(defs, date)
     if keep.empty:
-        return None
-    print(f"  {date} {root}: chain {len(defs)} -> {len(keep)} after prefilter")
+        return None, f"chain {len(defs)} -> 0 after prefilter"
 
     symbols = keep["raw_symbol"].str.strip().tolist()
-    q_cost = quote_cost(client, symbols[:SYMBOL_CHUNK], snap_start)
-    print(f"  {date} {root}: quotes ${q_cost:.6f} for {len(symbols)} contracts")
-    if budget is not None:
-        budget["spent"] += 0.0 if q_cost != q_cost else q_cost
-        if budget["cap"] is not None and budget["spent"] > budget["cap"]:
-            raise RuntimeError(
-                f"estimated spend ${budget['spent']:.4f} exceeds --max-cost "
-                f"${budget['cap']:.4f}"
-            )
+    chunks = [symbols[i:i + SYMBOL_CHUNK] for i in range(0, len(symbols), SYMBOL_CHUNK)]
+    # Price one chunk and scale. Billing is exactly linear in record count
+    # (verified: 10 venue records per contract, cost strictly proportional), so
+    # this is as accurate as pricing every chunk while costing one round trip
+    # instead of three — and this loop is latency-bound, so those round trips
+    # are precisely what is worth removing. Pricing the first chunk *without*
+    # scaling was the earlier bug: it under-reported any chain past 1500.
+    sample = chunks[0]
+    unit = quote_cost(client, sample, snap_start) / len(sample)
+    q_cost = unit * len(symbols)
+    charge(budget, q_cost)
 
     frames = []
     for i in range(0, len(symbols), SYMBOL_CHUNK):
@@ -183,14 +231,20 @@ def fetch_day(
         if not q.empty:
             frames.append(q.reset_index())
     if not frames:
-        return None
+        return None, f"{len(symbols)} contracts, no quotes returned"
     quotes = pd.concat(frames, ignore_index=True)
 
     # Last *row* per instrument in the window. groupby().last() takes the last
     # non-null value per column independently, which can pair a bid from one
     # timestamp with an ask from another.
+    #
+    # Ordered by ts_recv (the interval close, always populated) rather than
+    # ts_event, which is the last book *update* and is null for any interval
+    # where nothing traded — most of an option chain. Sorting on it put those
+    # nulls last, so keep="last" preferred the row with no timestamp. ts_event
+    # only breaks ties, with nulls first so a real update wins.
     quotes = (
-        quotes.sort_values("ts_event")
+        quotes.sort_values(["ts_recv", "ts_event"], na_position="first")
         .drop_duplicates("instrument_id", keep="last")
         .reset_index(drop=True)
     )
@@ -204,19 +258,33 @@ def fetch_day(
         # A two-sided market is required: 0/0 on an unquoted strike would be
         # NaN, and a one-sided book makes the spread meaningless.
         rel_spread=((ask - bid) / mid).where(mid > 0),
-        snapshot_ts=quotes["ts_event"],
+        # The interval this quote closes, not the last book update: ts_event is
+        # null on any contract that went unquoted through the minute.
+        snapshot_ts=quotes["ts_recv"],
+        bid_size=quotes["bid_sz_00"],
+        ask_size=quotes["ask_sz_00"],
+        # Kept precisely *because* it is often null: ts_event is the last book
+        # update, so a null (or an old one) marks a quote carried forward
+        # through the snapshot minute rather than set during it. That is the
+        # staleness signal the surface fit needs to down-weight a point;
+        # `rel_spread` cannot see it. Free — it rides along in the same payload.
+        last_update_ts=quotes["ts_event"],
     )
     quotes = quotes[(bid > 0) & (ask > 0) & (ask >= bid)]
     if quotes.empty:
-        return None
-    quotes = quotes[["instrument_id", "bid", "ask", "mid", "rel_spread", "snapshot_ts"]]
+        return None, f"{len(symbols)} contracts, none two-sided"
+    quotes = quotes[[
+        "instrument_id", "bid", "ask", "mid", "rel_spread", "snapshot_ts",
+        "bid_size", "ask_size", "last_update_ts",
+    ]]
 
     out = quotes.merge(keep, on="instrument_id", how="inner")
     out["quote_date"] = date
     out["tte"] = (
         pd.to_datetime(out["expiry"]) - pd.Timestamp(date)
     ).dt.days / 365.25
-    return out
+    return out, (f"chain {len(defs)}->{len(keep)}, {len(out)} quotes, "
+                 f"${d_cost + q_cost:.6f}")
 
 
 def check_scale(df: pd.DataFrame, date: dt.date) -> None:
@@ -252,43 +320,126 @@ def preview_cost(client: db.Historical, root: str, sample_date: dt.date) -> None
     print(f"  ~${cost * 252:.2f} for 252 sessions, excluding definitions")
 
 
-def run(client, con, root: str, dates, force: bool, budget: dict) -> None:
+def run(key: str, con, root: str, dates, force: bool, budget: dict,
+        workers: int) -> bool:
+    """Ingest every outstanding session for `root`. Returns False if the run
+    was cut short (budget cap or a systemic failure), True otherwise.
+
+    Fetching runs on a thread pool because the work is latency-bound; writing
+    stays on this thread because DuckDB takes a single writer, and serialising
+    the writes also keeps `upsert`'s delete+insert transaction uncontended.
+    """
     done = set() if force else options_db.done_dates(con, root)
     todo = [d for d in dates if d not in done]
-    print(f"{root}: {len(todo)} sessions to ingest ({len(dates) - len(todo)} already done)")
+    print(f"{root}: {len(todo)} sessions to ingest "
+          f"({len(dates) - len(todo)} already done)")
+    if not todo:
+        return True
 
-    consecutive = 0
-    for d in todo:
+    # Ordering is meaningless once completions arrive out of order, so the
+    # systemic-failure guard watches the last few *real* outcomes instead.
+    # Holidays are excluded: they are a calendar fact, not a failure.
+    recent: deque[bool] = deque(maxlen=MAX_CONSECUTIVE_ERRORS)
+    stop = threading.Event()
+    t0 = time.perf_counter()
+    ok = empty = failed = 0
+
+    def fetch(d):
+        if stop.is_set():
+            return d, None, None, "skipped"
         try:
-            df = fetch_day(client, root, d, budget)
-        except Exception as e:  # noqa: BLE001 — classified below
-            consecutive += 1
-            options_db.record(con, d, root, "error", detail=str(e)[:500])
-            print(f"  {d} {root}: ERROR {e}", file=sys.stderr)
-            if consecutive >= MAX_CONSECUTIVE_ERRORS:
-                print(
-                    f"aborting after {consecutive} consecutive failures — this "
-                    f"is a credentials/quota problem, not a calendar one",
-                    file=sys.stderr,
+            df, note = fetch_day(client_for(key), root, d, budget)
+            return d, df, None, note
+        except Exception as e:  # noqa: BLE001 — classified by the caller
+            return d, None, e, ""
+
+    # Submit a bounded window rather than the whole list. The pool drains
+    # independently of this thread, so queueing everything up front lets it run
+    # arbitrarily far ahead — and every session it starts is billed before the
+    # cap can be observed here. A window of 2x workers keeps the worst-case
+    # overshoot past --max-cost to a handful of sessions instead of the tail of
+    # the entire run.
+    queue = iter(todo)
+    n = 0
+    with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = {}
+
+        def submit_next() -> bool:
+            nxt = next(queue, None)
+            if nxt is None:
+                return False
+            pending[pool.submit(fetch, nxt)] = nxt
+            return True
+
+        for _ in range(workers * 2):
+            if not submit_next():
+                break
+
+        while pending:
+            finished, _ = cf.wait(pending, return_when=cf.FIRST_COMPLETED)
+            for fut in finished:
+                pending.pop(fut)
+                n += 1
+                # Refill immediately, whatever the outcome: doing it only on the
+                # success path would shrink the window on every holiday or error
+                # until the pool starved.
+                if not stop.is_set():
+                    submit_next()
+                d, df, err, note = fut.result()
+                rate = (time.perf_counter() - t0) / n
+                eta = dt.timedelta(seconds=round(rate * (len(todo) - n)))
+                head = f"[{n}/{len(todo)} eta {eta}] {d} {root}:"
+
+                if isinstance(err, BudgetExceeded):
+                    print(f"{head} STOP {err}", file=sys.stderr)
+                    stop.set()
+                    break
+                if err is not None and is_no_chain(err):
+                    options_db.record(con, d, root, "empty", detail="market holiday")
+                    empty += 1
+                    print(f"{head} holiday, no chain")
+                    continue
+                if err is not None:
+                    failed += 1
+                    recent.append(False)
+                    options_db.record(con, d, root, "error", detail=str(err)[:500])
+                    print(f"{head} ERROR {err}", file=sys.stderr)
+                    if len(recent) == recent.maxlen and not any(recent):
+                        print(f"aborting after {recent.maxlen} consecutive failures "
+                              f"— this is a credentials/quota problem, not a "
+                              f"calendar one", file=sys.stderr)
+                        stop.set()
+                        break
+                    continue
+
+                recent.append(True)
+                if df is None or df.empty:
+                    # Half-day (15:45 is after a 13:00 close), or a chain the
+                    # prefilter emptied. Recorded so a rerun does not re-request it.
+                    options_db.record(con, d, root, "empty", detail=note)
+                    empty += 1
+                    print(f"{head} no quotes ({note})")
+                    continue
+
+                check_scale(df, d)
+                options_db.write_partition(
+                    con, df.reindex(columns=options_db.COLUMNS), d, root
                 )
-                return
-            continue
+                written = options_db.write_quotes(con, df)
+                options_db.record(con, d, root, "ok", contracts=written)
+                ok += 1
+                print(f"{head} {note}")
 
-        consecutive = 0
-        if df is None or df.empty:
-            # Holiday, half-day (15:45 is after a 13:00 close), or a chain that
-            # the prefilter emptied. Recorded so a rerun does not re-request it.
-            options_db.record(con, d, root, "empty")
-            print(f"  {d} {root}: no quotes")
-            continue
+            if stop.is_set():
+                for f in pending:
+                    f.cancel()
+                break
 
-        check_scale(df, d)
-        options_db.write_partition(
-            con, df.reindex(columns=options_db.COLUMNS), d, root
-        )
-        n = options_db.write_quotes(con, df)
-        options_db.record(con, d, root, "ok", contracts=n)
-        print(f"  {d} {root}: {n} quotes")
+    elapsed = time.perf_counter() - t0
+    print(f"{root}: {ok} ok, {empty} empty, {failed} failed in "
+          f"{elapsed / 60:.1f} min ({elapsed / max(ok + empty + failed, 1):.1f}s "
+          f"per session)")
+    return not stop.is_set()
 
 
 def main() -> int:
@@ -303,6 +454,8 @@ def main() -> int:
                    help="abort once estimated spend exceeds this many dollars")
     p.add_argument("--preview-cost", action="store_true",
                    help="price one day's request and exit without ingesting")
+    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                   help=f"concurrent session fetches (default {DEFAULT_WORKERS})")
     args = p.parse_args()
 
     key = os.environ.get("DATABENTO_API_KEY")
@@ -315,24 +468,25 @@ def main() -> int:
     end = dt.date.fromisoformat(args.end) if args.end else start
     dates = [d.date() for d in pd.bdate_range(start, end)]
 
-    client = db.Historical(key)
-
     if args.preview_cost:
         for root in roots:
-            preview_cost(client, root, start)
+            preview_cost(client_for(key), root, start)
         return 0
 
     con = options_db.connect()
     try:
         budget = {"spent": 0.0, "cap": args.max_cost}
+        complete = True
         for root in roots:
-            run(client, con, root, dates, args.force, budget)
+            if not run(key, con, root, dates, args.force, budget, args.workers):
+                complete = False
+                break
         print(f"estimated spend this run: ${budget['spent']:.6f}")
         out = options_db.export(con)
         print(f"exported {out}: {options_db.summary(con)}")
     finally:
         con.close()
-    return 0
+    return 0 if complete else 1
 
 
 if __name__ == "__main__":

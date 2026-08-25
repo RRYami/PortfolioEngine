@@ -39,6 +39,9 @@ COLUMNS = [
     "rel_spread",
     "tte",
     "snapshot_ts",
+    "bid_size",
+    "ask_size",
+    "last_update_ts",
 ]
 
 
@@ -65,8 +68,20 @@ def connect(path: Path | None = None) -> duckdb.DuckDBPyConnection:
                rel_spread    DOUBLE,
                tte           DOUBLE,
                snapshot_ts   TIMESTAMPTZ,
+               bid_size      INTEGER,
+               ask_size      INTEGER,
+               last_update_ts TIMESTAMPTZ,
                PRIMARY KEY (quote_date, root, expiry, opt_right, strike))"""
     )
+    # Migration for stores created before quote sizes and staleness were kept.
+    # `upsert` does `INSERT ... SELECT *`, which is positional, so these have to
+    # land in the same order as the tail of COLUMNS.
+    for name, kind in (
+        ("bid_size", "INTEGER"),
+        ("ask_size", "INTEGER"),
+        ("last_update_ts", "TIMESTAMPTZ"),
+    ):
+        con.execute(f"ALTER TABLE option_quotes ADD COLUMN IF NOT EXISTS {name} {kind}")
     # Lets a restarted backfill skip days already paid for, and distinguishes a
     # session that genuinely had no chain from one that errored.
     con.execute(
@@ -97,11 +112,24 @@ def upsert(con, table: str, df: pd.DataFrame, keys: tuple[str, ...]) -> None:
     key_expr = ", ".join(keys)
     con.register("_incoming", df)
     try:
-        con.execute(
-            f"DELETE FROM {table} WHERE ({key_expr}) "
-            f"IN (SELECT {key_expr} FROM _incoming)"
-        )
-        con.execute(f"INSERT INTO {table} SELECT * FROM _incoming")
+        # Both statements or neither. The delete is unconditional but the
+        # insert can still fail the primary key -- two instrument_ids parsing
+        # to one (root, expiry, right, strike), which OPRA does produce on
+        # adjusted contracts. Autocommitted separately, that leaves the delete
+        # applied and the replacement rows gone: the day silently loses the
+        # chain it already had. The caller records the raised error and the
+        # date can be re-ingested.
+        con.execute("BEGIN TRANSACTION")
+        try:
+            con.execute(
+                f"DELETE FROM {table} WHERE ({key_expr}) "
+                f"IN (SELECT {key_expr} FROM _incoming)"
+            )
+            con.execute(f"INSERT INTO {table} SELECT * FROM _incoming")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        con.execute("COMMIT")
     finally:
         con.unregister("_incoming")
 
