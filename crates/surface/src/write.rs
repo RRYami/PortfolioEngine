@@ -19,6 +19,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use crate::build::{ForwardRow, GridRow, IvRow, SviRow};
+use crate::factors::FactorFit;
 use crate::error::SurfaceError;
 
 const EPOCH: NaiveDate = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch");
@@ -188,5 +189,79 @@ pub fn grid(path: &Path, rows: &[GridRow]) -> Result<(), SurfaceError> {
         f64c(|r| r.total_variance),
         f64c(|r| r.vol),
         Arc::new(BooleanArray::from(rows.iter().map(|r| r.extrapolated).collect::<Vec<_>>())),
+    ])
+}
+
+/// Loadings, one row per (component, cell), plus the standardisation each cell
+/// needs in order to invert a reconstructed shock.
+pub fn pca_loadings(path: &Path, fits: &[FactorFit]) -> Result<(), SurfaceError> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("root", DataType::Utf8, false),
+        Field::new("as_of", DataType::Date32, false),
+        Field::new("pc", DataType::UInt32, false),
+        Field::new("z", DataType::Float64, false),
+        Field::new("tte", DataType::Float64, false),
+        Field::new("loading", DataType::Float64, false),
+        Field::new("cell_mean", DataType::Float64, false),
+        Field::new("cell_sd", DataType::Float64, false),
+        Field::new("explained", DataType::Float64, false),
+    ]));
+    let (mut root, mut as_of, mut pc) = (vec![], vec![], vec![]);
+    let (mut z, mut tte, mut load) = (vec![], vec![], vec![]);
+    let (mut cmean, mut csd, mut expl) = (vec![], vec![], vec![]);
+    for f in fits {
+        for (j, vec) in f.fit.loadings.iter().enumerate() {
+            for (i, cell) in f.cells.iter().enumerate() {
+                root.push(f.root.as_str());
+                as_of.push(days(f.as_of));
+                pc.push(u32::try_from(j + 1).unwrap_or(u32::MAX));
+                z.push(cell.z);
+                tte.push(cell.tte);
+                load.push(vec[i]);
+                cmean.push(f.fit.mean[i]);
+                csd.push(f.fit.sd[i]);
+                expl.push(f.fit.explained[j]);
+            }
+        }
+    }
+    write(path, schema, vec![
+        Arc::new(StringArray::from_iter_values(root)),
+        Arc::new(Date32Array::from(as_of)),
+        Arc::new(UInt32Array::from(pc)),
+        Arc::new(Float64Array::from(z)),
+        Arc::new(Float64Array::from(tte)),
+        Arc::new(Float64Array::from(load)),
+        Arc::new(Float64Array::from(cmean)),
+        Arc::new(Float64Array::from(csd)),
+        Arc::new(Float64Array::from(expl)),
+    ])
+}
+
+/// The historical score series. Kept as a series rather than a covariance so
+/// the engine can estimate the joint distribution of scores and spot returns
+/// with the machinery it already has.
+pub fn pca_scores(path: &Path, fits: &[FactorFit]) -> Result<(), SurfaceError> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("root", DataType::Utf8, false),
+        Field::new("quote_date", DataType::Date32, false),
+        Field::new("pc", DataType::UInt32, false),
+        Field::new("score", DataType::Float64, false),
+    ]));
+    let (mut root, mut date, mut pc, mut score) = (vec![], vec![], vec![], vec![]);
+    for f in fits {
+        for (i, d) in f.dates.iter().enumerate() {
+            for (j, s) in f.fit.scores[i].iter().enumerate() {
+                root.push(f.root.as_str());
+                date.push(days(*d));
+                pc.push(u32::try_from(j + 1).unwrap_or(u32::MAX));
+                score.push(*s);
+            }
+        }
+    }
+    write(path, schema, vec![
+        Arc::new(StringArray::from_iter_values(root)),
+        Arc::new(Date32Array::from(date)),
+        Arc::new(UInt32Array::from(pc)),
+        Arc::new(Float64Array::from(score)),
     ])
 }

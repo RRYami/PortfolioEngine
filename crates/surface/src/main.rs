@@ -14,6 +14,7 @@
 
 mod build;
 mod error;
+mod factors;
 mod quotes;
 mod write;
 
@@ -87,6 +88,12 @@ fn run() -> Result<(), error::SurfaceError> {
     write::svis(&svi_path, &svis)?;
     write::grid(&grid_path, &grid)?;
 
+    let fits = fit_factors(&grid);
+    let load_path = out.join("vol_pca_loadings.parquet");
+    let score_path = out.join("vol_pca_scores.parquet");
+    write::pca_loadings(&load_path, &fits)?;
+    write::pca_scores(&score_path, &fits)?;
+
     let arb = svis.iter().filter(|s| s.min_durrleman < 0.0).count();
     let worst = svis.iter().map(|s| s.rmse_vol).fold(0.0_f64, f64::max);
     eprintln!(
@@ -107,6 +114,7 @@ fn run() -> Result<(), error::SurfaceError> {
         grid_path.display(),
         grid.len()
     );
+    eprintln!("wrote {} and {}", load_path.display(), score_path.display());
     eprintln!(
         "rejected: {} itm, {} unstable, {} below intrinsic, {} above ceiling, \
          {} other, {} no forward; {no_curve} sessions without a curve",
@@ -118,6 +126,35 @@ fn run() -> Result<(), error::SurfaceError> {
         totals.no_forward
     );
     Ok(())
+}
+
+/// Fit the factor model per root, over the whole history rather than per
+/// session: a decomposition needs a window of daily changes, not a snapshot.
+fn fit_factors(grid: &[build::GridRow]) -> Vec<factors::FactorFit> {
+    let mut by_root: std::collections::BTreeMap<&str, Vec<build::GridRow>> =
+        std::collections::BTreeMap::new();
+    for g in grid {
+        by_root.entry(g.root.as_str()).or_default().push(g.clone());
+    }
+    let mut fits = Vec::new();
+    for (r, rows) in &by_root {
+        match factors::fit_root(r, rows) {
+            Ok(f) => {
+                eprintln!(
+                    "  {r}: {} components over {} cells and {} changes; they explain {:.1}% \
+                     ({} cells dropped as mostly extrapolated)",
+                    f.fit.components(),
+                    f.cells.len(),
+                    f.dates.len(),
+                    f.fit.retained_variance() * 100.0,
+                    f.dropped.len()
+                );
+                fits.push(f);
+            }
+            Err(e) => eprintln!("  {r}: no factor fit ({e})"),
+        }
+    }
+    fits
 }
 
 /// Tiny helper so the quote count reads without naming the nested map type.
