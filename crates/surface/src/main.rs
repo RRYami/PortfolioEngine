@@ -56,6 +56,7 @@ fn run() -> Result<(), error::SurfaceError> {
     let mut forwards = Vec::new();
     let mut ivs = Vec::new();
     let mut svis = Vec::new();
+    let mut grid = Vec::new();
     let mut totals = Rejects::default();
     let mut no_curve = 0usize;
 
@@ -74,14 +75,17 @@ fn run() -> Result<(), error::SurfaceError> {
         forwards.extend(out.forwards);
         ivs.extend(out.ivs);
         svis.extend(out.svis);
+        grid.extend(out.grid);
     }
 
     let fwd_path = out.join("option_forwards.parquet");
     let iv_path = out.join("option_iv.parquet");
     let svi_path = out.join("vol_surface_params.parquet");
+    let grid_path = out.join("vol_grid.parquet");
     write::forwards(&fwd_path, &forwards)?;
     write::ivs(&iv_path, &ivs)?;
     write::svis(&svi_path, &svis)?;
+    write::grid(&grid_path, &grid)?;
 
     let arb = svis.iter().filter(|s| s.min_durrleman < 0.0).count();
     let worst = svis.iter().map(|s| s.rmse_vol).fold(0.0_f64, f64::max);
@@ -95,6 +99,13 @@ fn run() -> Result<(), error::SurfaceError> {
         svi_path.display(),
         svis.len(),
         worst
+    );
+    let extrap = grid.iter().filter(|g| g.extrapolated).count();
+    let expected = build::GRID_Z.len() * build::GRID_TAU.len() * chain.len();
+    eprintln!(
+        "wrote {} ({} cells of {expected} possible, {extrap} extrapolated)",
+        grid_path.display(),
+        grid.len()
     );
     eprintln!(
         "rejected: {} itm, {} unstable, {} below intrinsic, {} above ceiling, \

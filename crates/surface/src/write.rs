@@ -18,7 +18,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
-use crate::build::{ForwardRow, IvRow, SviRow};
+use crate::build::{ForwardRow, GridRow, IvRow, SviRow};
 use crate::error::SurfaceError;
 
 const EPOCH: NaiveDate = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch");
@@ -162,5 +162,31 @@ pub fn svis(path: &Path, rows: &[SviRow]) -> Result<(), SurfaceError> {
         f64c(|r| r.min_durrleman),
         f64c(|r| r.k_lo),
         f64c(|r| r.k_hi),
+    ])
+}
+
+pub fn grid(path: &Path, rows: &[GridRow]) -> Result<(), SurfaceError> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("quote_date", DataType::Date32, false),
+        Field::new("root", DataType::Utf8, false),
+        Field::new("z", DataType::Float64, false),
+        Field::new("tte", DataType::Float64, false),
+        Field::new("k", DataType::Float64, false),
+        Field::new("total_variance", DataType::Float64, false),
+        Field::new("vol", DataType::Float64, false),
+        Field::new("extrapolated", DataType::Boolean, false),
+    ]));
+    let f64c = |f: fn(&GridRow) -> f64| -> ArrayRef {
+        Arc::new(Float64Array::from(rows.iter().map(f).collect::<Vec<_>>()))
+    };
+    write(path, schema, vec![
+        Arc::new(Date32Array::from(rows.iter().map(|r| days(r.quote_date)).collect::<Vec<_>>())),
+        Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.root.as_str()))),
+        f64c(|r| r.z),
+        f64c(|r| r.tte),
+        f64c(|r| r.k),
+        f64c(|r| r.total_variance),
+        f64c(|r| r.vol),
+        Arc::new(BooleanArray::from(rows.iter().map(|r| r.extrapolated).collect::<Vec<_>>())),
     ])
 }

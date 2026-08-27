@@ -5,6 +5,7 @@
 
 use chrono::NaiveDate;
 use ptf_engine::forward::{DEFAULT_BAND, DiscountCurve, ParityPair, fit_curve, forward_at};
+use ptf_engine::grid::{FittedSlice, sample_grid};
 use ptf_engine::svi::{MIN_POINTS, SlicePoint, Svi, calibrate};
 use ptf_engine::vol::{OptionRight, VolError, implied_vol, vega};
 
@@ -75,10 +76,39 @@ pub struct SviRow {
     pub k_hi: f64,
 }
 
+/// Standardised-moneyness axis.
+///
+/// Deliberately asymmetric, because the chain is. Measured over 3472 fitted
+/// slices, only 7.7% span +/-2 symmetrically while 68.9% reach -2 on the
+/// downside: the ingest's moneyness prefilter is a *strike ratio*, so in `z`
+/// terms the call wing truncates as maturity grows. A symmetric grid would be
+/// mostly SVI extrapolation on the upside. It also happens to match where the
+/// risk is on an equity surface.
+pub const GRID_Z: [f64; 6] = [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5];
+
+/// Constant maturities, in years. All four are bracketed by 100% of sessions;
+/// 18 months drops to 90% and two years to 74%, so they are left out rather
+/// than punching holes in the panel the PCA consumes.
+pub const GRID_TAU: [f64; 4] = [1.0 / 12.0, 0.25, 0.5, 1.0];
+
+/// One row of `vol_grid`.
+#[derive(Debug, Clone)]
+pub struct GridRow {
+    pub quote_date: NaiveDate,
+    pub root: String,
+    pub z: f64,
+    pub tte: f64,
+    pub k: f64,
+    pub total_variance: f64,
+    pub vol: f64,
+    pub extrapolated: bool,
+}
+
 pub struct SessionOutput {
     pub forwards: Vec<ForwardRow>,
     pub ivs: Vec<IvRow>,
     pub svis: Vec<SviRow>,
+    pub grid: Vec<GridRow>,
     pub rejects: Rejects,
     pub curve: Option<DiscountCurve>,
 }
@@ -139,6 +169,7 @@ pub fn build_session(
             forwards: vec![],
             ivs: vec![],
             svis: vec![],
+            grid: vec![],
             rejects,
             curve: None,
         };
@@ -205,7 +236,24 @@ pub fn build_session(
         }
     }
     let svis = fit_slices(&ivs);
-    SessionOutput { forwards, ivs, svis, rejects, curve: Some(curve) }
+    let slices: Vec<FittedSlice> = svis
+        .iter()
+        .map(|s| FittedSlice { tte: s.tte, svi: s.params, k_lo: s.k_lo, k_hi: s.k_hi })
+        .collect();
+    let grid = sample_grid(&slices, &GRID_Z, &GRID_TAU)
+        .into_iter()
+        .map(|c| GridRow {
+            quote_date,
+            root: root.to_string(),
+            z: c.z,
+            tte: c.tte,
+            k: c.k,
+            total_variance: c.total_variance,
+            vol: c.vol,
+            extrapolated: c.extrapolated,
+        })
+        .collect();
+    SessionOutput { forwards, ivs, svis, grid, rejects, curve: Some(curve) }
 }
 
 /// Weight one observation by how precisely its quote pins the volatility.

@@ -8,6 +8,7 @@ pub mod error;
 pub mod fold;
 pub mod forward;
 pub mod fx;
+pub mod grid;
 pub mod historical_price;
 pub mod ids;
 pub mod instrument;
@@ -38,6 +39,7 @@ pub use fx::{
     FxError, FxRateProvider, HistoricalFxProvider, StaticFxRateProvider,
     TriangulatingFxProvider,
 };
+pub use grid::{FittedSlice, GridCell, sample_grid};
 pub use historical_price::{HistoricalPriceProvider, StaticHistoricalPriceProvider};
 pub use ids::{InstrumentId, LotId, PortfolioId, TransactionId, UserId};
 pub use instrument::{Instrument, InstrumentKind};
