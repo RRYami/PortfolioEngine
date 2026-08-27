@@ -100,15 +100,7 @@ pub fn implied_forward(pairs: &[ParityPair], band: f64) -> Result<ImpliedForward
         return Err(ForwardError::TooFewPairs { got: pairs.len(), need: MIN_PAIRS });
     }
 
-    let mut centre = pairs
-        .iter()
-        .min_by(|a, b| {
-            (a.call_mid - a.put_mid)
-                .abs()
-                .partial_cmp(&(b.call_mid - b.put_mid).abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map_or(f64::NAN, |p| p.strike);
+    let mut centre = atm_centre(pairs);
 
     let mut fit = fit_band(pairs, centre, band)?;
     centre = fit.forward;
@@ -118,7 +110,24 @@ pub fn implied_forward(pairs: &[ParityPair], band: f64) -> Result<ImpliedForward
     Ok(fit)
 }
 
-fn fit_band(pairs: &[ParityPair], centre: f64, band: f64) -> Result<ImpliedForward, ForwardError> {
+/// Weighted least squares of `C-P` on `K`, with no interpretation applied.
+///
+/// Split out from [`fit_band`] because the two callers want different things
+/// from the same regression: a forward needs a discount factor in `(0, 1]` to
+/// mean anything, while curve seeding wants the raw slope *including* the
+/// out-of-range ones — those are the noisy short-dated expiries, and
+/// [`DiscountCurve::fit`] absorbs them as a negative residual rather than
+/// being misled by them. Rejecting them before seeding threw away exactly the
+/// observations the through-origin fit was built to tolerate.
+struct Regression {
+    slope: f64,
+    intercept: f64,
+    used: usize,
+    sw: f64,
+    sse: f64,
+}
+
+fn regress(pairs: &[ParityPair], centre: f64, band: f64) -> Result<Regression, ForwardError> {
     let inside: Vec<&ParityPair> = pairs
         .iter()
         .filter(|p| p.strike > 0.0 && p.weight > 0.0 && (p.strike / centre).ln().abs() <= band)
@@ -147,13 +156,6 @@ fn fit_band(pairs: &[ParityPair], centre: f64, band: f64) -> Result<ImpliedForwa
     }
     let slope = (sw * sxy - sx * sy) / den;
     let intercept = (sy - slope * sx) / sw;
-
-    let discount = -slope;
-    if !(discount > 0.0 && discount <= 1.0) {
-        return Err(ForwardError::DiscountOutOfRange(discount));
-    }
-    let forward = intercept / discount;
-
     let sse: f64 = used
         .iter()
         .map(|p| {
@@ -161,13 +163,61 @@ fn fit_band(pairs: &[ParityPair], centre: f64, band: f64) -> Result<ImpliedForwa
             p.weight * resid * resid
         })
         .sum();
+    Ok(Regression { slope, intercept, used: used.len(), sw, sse })
+}
 
+fn fit_band(pairs: &[ParityPair], centre: f64, band: f64) -> Result<ImpliedForward, ForwardError> {
+    let r = regress(pairs, centre, band)?;
+    let discount = -r.slope;
+    if !(discount > 0.0 && discount <= 1.0) {
+        return Err(ForwardError::DiscountOutOfRange(discount));
+    }
     Ok(ImpliedForward {
-        forward,
+        forward: r.intercept / discount,
         discount,
-        pairs_used: used.len(),
-        rmse: (sse / sw).sqrt(),
+        pairs_used: r.used,
+        rmse: (r.sse / r.sw).sqrt(),
     })
+}
+
+/// The discount factor a single expiry implies, *unvalidated* — feed this to
+/// [`DiscountCurve::fit`].
+///
+/// Deliberately returns values above 1.0. At three weeks the true factor is
+/// about 0.9998 and the slope carries ~2e-4 of signal against tens of cents of
+/// quote residual, so a fair fraction of short expiries land above 1. They are
+/// still information about the rate; discarding them is what starved the curve
+/// on 20 of 250 real sessions, worst case 3 usable expiries out of 13.
+pub fn seed_discount(pairs: &[ParityPair], band: f64) -> Result<f64, ForwardError> {
+    let centre = atm_centre(pairs);
+    Ok(-regress(pairs, centre, band)?.slope)
+}
+
+/// Fit the curve directly from a session's slices, seeding from every expiry
+/// that regresses at all.
+pub fn fit_curve<'a, I>(slices: I, band: f64) -> Result<DiscountCurve, ForwardError>
+where
+    I: IntoIterator<Item = (f64, &'a [ParityPair])>,
+{
+    let seeds: Vec<(f64, f64)> = slices
+        .into_iter()
+        .filter_map(|(tte, pairs)| seed_discount(pairs, band).ok().map(|d| (tte, d)))
+        .collect();
+    DiscountCurve::fit(&seeds)
+}
+
+/// Strike where `|C-P|` is smallest — the empirical at-the-money crossover,
+/// where `K ~ F`, used to centre the moneyness band before a forward is known.
+fn atm_centre(pairs: &[ParityPair]) -> f64 {
+    pairs
+        .iter()
+        .min_by(|a, b| {
+            (a.call_mid - a.put_mid)
+                .abs()
+                .partial_cmp(&(b.call_mid - b.put_mid).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map_or(f64::NAN, |p| p.strike)
 }
 
 /// A flat continuously-compounded rate fitted across a whole chain.
@@ -188,6 +238,9 @@ pub struct DiscountCurve {
     pub expiries_used: usize,
     /// RMS of `-ln(DF_i) - r*T_i` across the fitted expiries.
     pub rms_residual: f64,
+    /// The raw fit came out negative and was floored at zero. Downstream can
+    /// treat this session as lower confidence, or drop it.
+    pub clamped: bool,
 }
 
 impl DiscountCurve {
@@ -224,18 +277,31 @@ impl DiscountCurve {
         if stt <= 0.0 {
             return Err(ForwardError::Degenerate);
         }
-        let rate = sty / stt;
+        // A negative rate means DF > 1 at every tenor, which is free money and
+        // cannot be a real discount curve -- it is what a thin chain produces
+        // when most short-dated seeds land above 1.0 from noise and no long
+        // expiry is present to anchor the fit. Observed on 5 of 250 real
+        // sessions, all topping out around 1.3 years with no LEAP.
+        //
+        // Floor it at zero rather than propagate it. DF = 1 makes the forward
+        // the undiscounted parity value, and because forward_at averages a
+        // band that straddles the money, the error in (C-P)/DF is very nearly
+        // antisymmetric across it and largely cancels. Losing the whole
+        // session is much worse.
+        let raw = sty / stt;
+        let clamped = raw < 0.0;
+        let rate = if clamped { 0.0 } else { raw };
 
         let (mut sse, mut count) = (0.0, 0.0);
         for &(tte, df) in observations {
             if !(tte > 0.0 && df > 0.0 && df.is_finite()) {
                 continue;
             }
-            let resid = -df.ln() - rate * tte;
+            let resid = -df.ln() - rate * tte;   // against the clamped rate
             sse += resid * resid;
             count += 1.0;
         }
-        Ok(Self { rate, expiries_used: n, rms_residual: (sse / count).sqrt() })
+        Ok(Self { rate, expiries_used: n, rms_residual: (sse / count).sqrt(), clamped })
     }
 }
 
@@ -256,15 +322,7 @@ pub fn forward_at(
     if pairs.len() < MIN_PAIRS {
         return Err(ForwardError::TooFewPairs { got: pairs.len(), need: MIN_PAIRS });
     }
-    let centre = pairs
-        .iter()
-        .min_by(|a, b| {
-            (a.call_mid - a.put_mid)
-                .abs()
-                .partial_cmp(&(b.call_mid - b.put_mid).abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map_or(f64::NAN, |p| p.strike);
+    let centre = atm_centre(pairs);
 
     let solve = |centre: f64| -> Option<(f64, f64, usize)> {
         let inside: Vec<&ParityPair> = pairs
@@ -398,6 +456,21 @@ mod tests {
     }
 
     #[test]
+    fn negative_fit_is_floored_not_propagated() {
+        // Every seed above 1.0, as a chain with no long expiry produces.
+        let obs: Vec<(f64, f64)> =
+            [0.02_f64, 0.06, 0.12, 0.25, 0.5, 1.0].iter().map(|&t| (t, 1.01)).collect();
+        let c = DiscountCurve::fit(&obs).expect("fit");
+        assert!(c.clamped, "should have flagged the clamp");
+        assert!((c.rate - 0.0).abs() < 1e-12, "rate {}", c.rate);
+        // Which is the whole point: every tenor now yields a usable factor.
+        for &(t, _) in &obs {
+            let df = c.df(t);
+            assert!(df > 0.0 && df <= 1.0, "df({t}) = {df}");
+        }
+    }
+
+    #[test]
     fn curve_recovers_a_constant_rate() {
         let r = 0.0412_f64;
         let obs: Vec<(f64, f64)> = [0.02_f64, 0.1, 0.25, 0.5, 1.0, 2.0, 2.5]
@@ -405,6 +478,7 @@ mod tests {
             .map(|&t| (t, (-r * t).exp()))
             .collect();
         let c = DiscountCurve::fit(&obs).expect("fit");
+        assert!(!c.clamped);
         assert!((c.rate - r).abs() < 1e-12, "rate {}", c.rate);
         assert!(c.rms_residual < 1e-12);
         assert!((c.df(1.0) - (-r).exp()).abs() < 1e-12);
@@ -488,6 +562,48 @@ mod tests {
                 free.discount
             );
         }
+    }
+
+    /// The regression that starved the curve: three-week expiries whose
+    /// unconstrained discount lands above 1.0 must still seed it.
+    #[test]
+    fn seeding_keeps_estimates_above_one() {
+        let (f, t) = (522.0_f64, 0.0219_f64);
+        let df = (-0.0201 * t).exp();
+        let mut pairs = Vec::new();
+        for (i, k) in (495..=550).step_by(5).enumerate() {
+            let k = f64::from(k);
+            let mut p = parity_pair_from_model(k, f, t, 0.40, df);
+            // Enough half-tick noise to push the slope past -1.
+            let tick = if i % 2 == 0 { 0.06 } else { -0.06 };
+            p.call_mid += tick;
+            p.put_mid -= tick;
+            pairs.push(p);
+        }
+        let seed = seed_discount(&pairs, DEFAULT_BAND).expect("seed always yields a slope");
+        assert!(seed.is_finite() && seed > 0.0);
+        // Whatever it came out as, the curve must accept it as an observation.
+        let curve = DiscountCurve::fit(&[(t, seed), (1.0, (-0.0201_f64).exp()),
+                                         (2.0, (-0.0402_f64).exp())])
+            .expect("curve accepts it");
+        assert!(curve.expiries_used == 3, "seed was dropped: {}", curve.expiries_used);
+        assert!(curve.df(t) > 0.0 && curve.df(t) < 1.0);
+    }
+
+    #[test]
+    fn fit_curve_seeds_from_every_regressable_slice() {
+        let mk = |t: f64, r: f64| -> Vec<ParityPair> {
+            let df = (-r * t).exp();
+            (480..=560).step_by(5)
+                .map(|k| parity_pair_from_model(f64::from(k), 522.0, t, 0.40, df))
+                .collect()
+        };
+        let slices: Vec<(f64, Vec<ParityPair>)> =
+            [0.02_f64, 0.08, 0.25, 0.5, 1.0, 2.0].iter().map(|&t| (t, mk(t, 0.021))).collect();
+        let curve = fit_curve(slices.iter().map(|(t, p)| (*t, p.as_slice())), DEFAULT_BAND)
+            .expect("curve");
+        assert_eq!(curve.expiries_used, 6, "every slice should seed");
+        assert!((curve.rate - 0.021).abs() < 1e-6, "rate {}", curve.rate);
     }
 
     #[test]

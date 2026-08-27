@@ -1,0 +1,19 @@
+[package]
+name = "ptf-surface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ptf-surface"
+path = "src/main.rs"
+
+[dependencies]
+ptf-engine = { path = "../engine" }
+# Same versions crates/api already pins, so the workspace resolves one copy.
+arrow = "54"
+parquet = "54"
+chrono = { workspace = true }
+
+[lints]
+workspace = true

@@ -30,7 +30,8 @@ pub use currency::Currency;
 pub use error::DomainError;
 pub use fold::fold;
 pub use forward::{
-    DiscountCurve, ForwardError, ImpliedForward, ParityPair, forward_at, implied_forward,
+    DiscountCurve, ForwardError, ImpliedForward, ParityPair, fit_curve, forward_at,
+    implied_forward, seed_discount,
 };
 pub use fx::{
     FxError, FxRateProvider, HistoricalFxProvider, StaticFxRateProvider,
