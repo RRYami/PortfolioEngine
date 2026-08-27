@@ -55,6 +55,7 @@ fn run() -> Result<(), error::SurfaceError> {
 
     let mut forwards = Vec::new();
     let mut ivs = Vec::new();
+    let mut svis = Vec::new();
     let mut totals = Rejects::default();
     let mut no_curve = 0usize;
 
@@ -72,19 +73,28 @@ fn run() -> Result<(), error::SurfaceError> {
         totals.no_forward += out.rejects.no_forward;
         forwards.extend(out.forwards);
         ivs.extend(out.ivs);
+        svis.extend(out.svis);
     }
 
     let fwd_path = out.join("option_forwards.parquet");
     let iv_path = out.join("option_iv.parquet");
+    let svi_path = out.join("vol_surface_params.parquet");
     write::forwards(&fwd_path, &forwards)?;
     write::ivs(&iv_path, &ivs)?;
+    write::svis(&svi_path, &svis)?;
 
+    let arb = svis.iter().filter(|s| s.min_durrleman < 0.0).count();
+    let worst = svis.iter().map(|s| s.rmse_vol).fold(0.0_f64, f64::max);
     eprintln!(
-        "wrote {} ({} slices) and {} ({} points)",
+        "wrote {} ({} slices), {} ({} points), {} ({} smiles, {arb} with a butterfly \
+         violation, worst fit {:.4} vol pts)",
         fwd_path.display(),
         forwards.len(),
         iv_path.display(),
-        ivs.len()
+        ivs.len(),
+        svi_path.display(),
+        svis.len(),
+        worst
     );
     eprintln!(
         "rejected: {} itm, {} unstable, {} below intrinsic, {} above ceiling, \

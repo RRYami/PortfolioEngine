@@ -5,6 +5,7 @@
 
 use chrono::NaiveDate;
 use ptf_engine::forward::{DEFAULT_BAND, DiscountCurve, ParityPair, fit_curve, forward_at};
+use ptf_engine::svi::{MIN_POINTS, SlicePoint, Svi, calibrate};
 use ptf_engine::vol::{OptionRight, VolError, implied_vol, vega};
 
 use crate::quotes::Quote;
@@ -35,6 +36,7 @@ pub struct IvRow {
     pub expiry: NaiveDate,
     pub opt_right: OptionRight,
     pub strike: f64,
+    pub mid: f64,
     pub tte: f64,
     pub log_moneyness: f64,
     pub iv: f64,
@@ -58,9 +60,25 @@ pub struct Rejects {
     pub no_forward: usize,
 }
 
+/// One row of `vol_surface_params`.
+#[derive(Debug, Clone)]
+pub struct SviRow {
+    pub quote_date: NaiveDate,
+    pub root: String,
+    pub expiry: NaiveDate,
+    pub tte: f64,
+    pub params: Svi,
+    pub rmse_vol: f64,
+    pub points: usize,
+    pub min_durrleman: f64,
+    pub k_lo: f64,
+    pub k_hi: f64,
+}
+
 pub struct SessionOutput {
     pub forwards: Vec<ForwardRow>,
     pub ivs: Vec<IvRow>,
+    pub svis: Vec<SviRow>,
     pub rejects: Rejects,
     pub curve: Option<DiscountCurve>,
 }
@@ -117,7 +135,13 @@ pub fn build_session(
         DEFAULT_BAND,
     ) else {
         rejects.no_forward += slices.values().map(|(_, q)| q.len()).sum::<usize>();
-        return SessionOutput { forwards: vec![], ivs: vec![], rejects, curve: None };
+        return SessionOutput {
+            forwards: vec![],
+            ivs: vec![],
+            svis: vec![],
+            rejects,
+            curve: None,
+        };
     };
 
     let mut forwards = Vec::new();
@@ -163,6 +187,7 @@ pub fn build_session(
                     expiry: *expiry,
                     opt_right: q.right,
                     strike: q.strike,
+                    mid: q.mid,
                     tte: *tte,
                     log_moneyness: (q.strike / f).ln(),
                     iv,
@@ -179,5 +204,62 @@ pub fn build_session(
             }
         }
     }
-    SessionOutput { forwards, ivs, rejects, curve: Some(curve) }
+    let svis = fit_slices(&ivs);
+    SessionOutput { forwards, ivs, svis, rejects, curve: Some(curve) }
+}
+
+/// Weight one observation by how precisely its quote pins the volatility.
+///
+/// A mid is only known to about half the bid-ask width, and that price
+/// uncertainty maps to vol through vega: `d(sigma) ~ dPrice / vega`. Fitting in
+/// total variance, `w = sigma^2 * T`, so `dw = 2*sigma*T*d(sigma)`. The weight
+/// is the inverse variance of that. It is why wing quotes -- wide spreads over
+/// small vega -- barely move the fit, without needing an arbitrary cutoff.
+fn point_weight(iv: &IvRow) -> f64 {
+    if iv.vega <= 0.0 || !iv.vega.is_finite() || !iv.rel_spread.is_finite()
+        || iv.rel_spread <= 0.0
+    {
+        return 0.0;
+    }
+    let price_sd = 0.5 * iv.rel_spread * iv.mid;
+    let vol_sd = price_sd / iv.vega;
+    let w_sd = 2.0 * iv.iv * iv.tte * vol_sd;
+    if w_sd > 0.0 && w_sd.is_finite() { 1.0 / (w_sd * w_sd) } else { 0.0 }
+}
+
+/// Calibrate one SVI slice per expiry from the session's point cloud.
+fn fit_slices(ivs: &[IvRow]) -> Vec<SviRow> {
+    use std::collections::BTreeMap;
+    let mut by_expiry: BTreeMap<NaiveDate, Vec<&IvRow>> = BTreeMap::new();
+    for r in ivs {
+        by_expiry.entry(r.expiry).or_default().push(r);
+    }
+    let mut out = Vec::new();
+    for (expiry, rows) in by_expiry {
+        if rows.len() < MIN_POINTS {
+            continue;
+        }
+        let tte = rows[0].tte;
+        let points: Vec<SlicePoint> = rows
+            .iter()
+            .map(|r| SlicePoint { k: r.log_moneyness, w: r.iv * r.iv * tte, weight: point_weight(r) })
+            .collect();
+        let Ok(fit) = calibrate(&points, tte) else { continue };
+        let (k_lo, k_hi) = rows
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(l, h), r| (l.min(r.log_moneyness), h.max(r.log_moneyness)));
+        out.push(SviRow {
+            quote_date: rows[0].quote_date,
+            root: rows[0].root.clone(),
+            expiry,
+            tte,
+            params: fit.params,
+            rmse_vol: fit.rmse_vol,
+            points: fit.points,
+            min_durrleman: fit.min_durrleman,
+            k_lo,
+            k_hi,
+        });
+    }
+    out
 }

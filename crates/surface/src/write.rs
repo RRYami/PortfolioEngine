@@ -18,7 +18,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
-use crate::build::{ForwardRow, IvRow};
+use crate::build::{ForwardRow, IvRow, SviRow};
 use crate::error::SurfaceError;
 
 const EPOCH: NaiveDate = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch");
@@ -86,6 +86,7 @@ pub fn ivs(path: &Path, rows: &[IvRow]) -> Result<(), SurfaceError> {
         Field::new("expiry", DataType::Date32, false),
         Field::new("opt_right", DataType::Utf8, false),
         Field::new("strike", DataType::Float64, false),
+        Field::new("mid", DataType::Float64, false),
         Field::new("tte", DataType::Float64, false),
         Field::new("log_moneyness", DataType::Float64, false),
         Field::new("iv", DataType::Float64, false),
@@ -106,6 +107,7 @@ pub fn ivs(path: &Path, rows: &[IvRow]) -> Result<(), SurfaceError> {
             if matches!(r.opt_right, ptf_engine::vol::OptionRight::Call) { "C" } else { "P" }
         }))),
         f64c(|r| r.strike),
+        f64c(|r| r.mid),
         f64c(|r| r.tte),
         f64c(|r| r.log_moneyness),
         f64c(|r| r.iv),
@@ -118,5 +120,47 @@ pub fn ivs(path: &Path, rows: &[IvRow]) -> Result<(), SurfaceError> {
         )),
         f64c(|r| r.size),
         Arc::new(BooleanArray::from(rows.iter().map(|r| r.stale).collect::<Vec<_>>())),
+    ])
+}
+
+pub fn svis(path: &Path, rows: &[SviRow]) -> Result<(), SurfaceError> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("quote_date", DataType::Date32, false),
+        Field::new("root", DataType::Utf8, false),
+        Field::new("expiry", DataType::Date32, false),
+        Field::new("tte", DataType::Float64, false),
+        Field::new("a", DataType::Float64, false),
+        Field::new("b", DataType::Float64, false),
+        Field::new("rho", DataType::Float64, false),
+        Field::new("m", DataType::Float64, false),
+        Field::new("sigma", DataType::Float64, false),
+        Field::new("rmse_vol", DataType::Float64, false),
+        Field::new("points", DataType::UInt32, false),
+        Field::new("min_durrleman", DataType::Float64, false),
+        // The moneyness range the slice was fitted over. Evaluating outside it
+        // is extrapolation, and downstream should know where that starts.
+        Field::new("k_lo", DataType::Float64, false),
+        Field::new("k_hi", DataType::Float64, false),
+    ]));
+    let f64c = |f: fn(&SviRow) -> f64| -> ArrayRef {
+        Arc::new(Float64Array::from(rows.iter().map(f).collect::<Vec<_>>()))
+    };
+    write(path, schema, vec![
+        Arc::new(Date32Array::from(rows.iter().map(|r| days(r.quote_date)).collect::<Vec<_>>())),
+        Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.root.as_str()))),
+        Arc::new(Date32Array::from(rows.iter().map(|r| days(r.expiry)).collect::<Vec<_>>())),
+        f64c(|r| r.tte),
+        f64c(|r| r.params.a),
+        f64c(|r| r.params.b),
+        f64c(|r| r.params.rho),
+        f64c(|r| r.params.m),
+        f64c(|r| r.params.sigma),
+        f64c(|r| r.rmse_vol),
+        Arc::new(UInt32Array::from(
+            rows.iter().map(|r| u32::try_from(r.points).unwrap_or(u32::MAX)).collect::<Vec<_>>(),
+        )),
+        f64c(|r| r.min_durrleman),
+        f64c(|r| r.k_lo),
+        f64c(|r| r.k_hi),
     ])
 }
