@@ -141,10 +141,12 @@ pub fn load(
         if forwards.is_empty() {
             continue;
         }
-        let Some((cells, pca)) = read_factors(&loads, &scores, root) else { continue };
+        let Some((cells, pca, score_sessions)) = read_factors(&loads, &scores, root) else {
+            continue;
+        };
         provider.insert(
             *id,
-            SurfaceSnapshot { forwards, rate, slices, cells, pca },
+            SurfaceSnapshot { forwards, rate, slices, cells, pca, score_sessions },
         );
     }
     provider
@@ -231,7 +233,7 @@ fn read_factors(
     loads: &[RecordBatch],
     scores: &[RecordBatch],
     root: &str,
-) -> Option<(Vec<Cell>, PcaFit)> {
+) -> Option<(Vec<Cell>, PcaFit, Vec<NaiveDate>)> {
     let mut cells: Vec<Cell> = Vec::new();
     let mut by_pc: HashMap<u32, Vec<f64>> = HashMap::new();
     let mut mean: Vec<f64> = Vec::new();
@@ -290,10 +292,14 @@ fn read_factors(
     }
     let mut ordered: Vec<NaiveDate> = rows.keys().copied().collect();
     ordered.sort_unstable();
+    // Sessions are kept alongside the scores, not discarded: the risk engine
+    // joins this series to spot returns by date.
+    let mut sessions: Vec<NaiveDate> = Vec::new();
     for date in ordered {
         let row = &rows[&date];
         if components.iter().all(|c| row.contains_key(c)) {
             series.push(components.iter().map(|c| row[c]).collect());
+            sessions.push(date);
         }
     }
 
@@ -306,6 +312,7 @@ fn read_factors(
             explained: components.iter().map(|c| explained[c]).collect(),
             scores: series,
         },
+        sessions,
     ))
 }
 
@@ -348,6 +355,21 @@ mod tests {
         assert_eq!(snap.pca.components(), 3);
         assert_eq!(snap.pca.cells(), snap.cells.len());
         assert!(snap.pca.scores.len() > 200, "{} scores", snap.pca.scores.len());
+        // The risk engine drops the vol factor outright when these disagree,
+        // so a mismatch would silently cost every option its vega risk.
+        assert_eq!(
+            snap.score_sessions.len(),
+            snap.pca.scores.len(),
+            "one session date per score row"
+        );
+        assert!(
+            snap.score_sessions.windows(2).all(|w| w[1] > w[0]),
+            "sessions must be ascending, since the engine joins on them"
+        );
+        assert!(
+            snap.score_sessions.last().is_some_and(|d| *d <= as_of),
+            "a surface must not carry sessions from after the report date"
+        );
 
         // A three-month at-the-money call, priced off the real surface.
         let tau = 0.25;

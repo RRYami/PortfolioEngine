@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::prelude::ToPrimitive;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::currency::Currency;
 use crate::fx::FxRateProvider;
@@ -561,6 +561,15 @@ fn gather_assets(
 /// distribution of spot moves and surface moves, which is what preserves the
 /// leverage effect. Estimating them separately would lose the very correlation
 /// that makes a long put hedge an equity position.
+///
+/// Every series is keyed by date and the panel is the *intersection* of those
+/// dates. Aligning on position instead — taking the last `n` rows of each and
+/// assuming they describe the same days — is silently wrong whenever two
+/// sources disagree about the calendar, and they do: a vendor that emits a
+/// row on a market holiday for one ticker but not another shifts the two
+/// series against each other, and the estimated correlation collapses toward
+/// zero. The failure is invisible in the output, since a decorrelated panel
+/// still produces a plausible-looking `VaR`; it just stops recognising a hedge.
 fn build_factor_matrix(
     drivers: &[InstrumentId],
     assets: &mut [AssetInput],
@@ -569,16 +578,22 @@ fn build_factor_matrix(
     lookback: u32,
     as_of: NaiveDate,
 ) -> Result<Vec<Vec<f64>>, RiskError> {
-    let from = as_of - chrono::Duration::days(i64::from(lookback));
+    // `lookback` counts trading observations, so the window it is read from
+    // has to be wider than that many calendar days — roughly 7/5, plus the
+    // holidays. Asking for exactly `lookback` days back would return about
+    // 173 sessions and reject every real request. The panel is trimmed to
+    // `need` observations after the calendars are intersected.
+    let from = as_of - chrono::Duration::days(i64::from(lookback) * 2);
     let need = lookback as usize;
-    let mut matrix: Vec<Vec<f64>> = Vec::with_capacity(drivers.len());
+    // Dated series, in panel-column order.
+    let mut dated: Vec<Vec<(NaiveDate, f64)>> = Vec::with_capacity(drivers.len());
 
     for driver in drivers {
         let series = historical.prices(*driver, from, as_of)?;
-        if series.len() < need + 1 {
+        if series.len() <= MIN_FACTOR_OBSERVATIONS {
             return Err(RiskError::InsufficientHistory(
                 *driver,
-                lookback + 1,
+                u32::try_from(MIN_FACTOR_OBSERVATIONS + 1).unwrap_or(u32::MAX),
                 series.len(),
             ));
         }
@@ -586,13 +601,16 @@ fn build_factor_matrix(
         for window in series.windows(2) {
             let p_t = window[1].1.amount.to_f64().unwrap_or(1.0);
             let p_prev = window[0].1.amount.to_f64().unwrap_or(1.0);
+            // A return is dated by the day it was earned — the later of the
+            // pair — so it lines up with the same day's vol-factor move.
+            let date = window[1].0;
             if p_prev <= 0.0 || p_t <= 0.0 {
-                returns.push(0.0);
+                returns.push((date, 0.0));
             } else {
-                returns.push((p_t / p_prev).ln());
+                returns.push((date, (p_t / p_prev).ln()));
             }
         }
-        matrix.push(returns);
+        dated.push(returns);
     }
 
     // Volatility factors, appended per driver that has a surface.
@@ -600,18 +618,42 @@ fn build_factor_matrix(
     for driver in drivers {
         let Some(snapshot) = surfaces.surface(*driver, as_of) else { continue };
         let scores = &snapshot.pca.scores;
+        let sessions = &snapshot.score_sessions;
+        // A snapshot whose dates do not describe its scores cannot be joined;
+        // dropping the factor loses the vega term but keeps spot risk correct,
+        // which beats aligning it wrongly.
+        if sessions.len() != scores.len() {
+            continue;
+        }
         let k = snapshot.pca.components();
-        score_index.insert(*driver, (matrix.len(), k));
+        score_index.insert(*driver, (dated.len(), k));
         for j in 0..k {
-            matrix.push(scores.iter().map(|row| row[j]).collect());
+            dated.push(
+                sessions
+                    .iter()
+                    .zip(scores.iter())
+                    .map(|(d, row)| (*d, row[j]))
+                    .collect(),
+            );
         }
     }
 
-    // Rectangularise on the shortest series, keeping the most recent
-    // observations. Aligning on the tail rather than the head matters: the
-    // series must describe the *same* days, and they all end at `as_of`.
-    let common = matrix.iter().map(Vec::len).min().unwrap_or(0);
-    if common < MIN_FACTOR_OBSERVATIONS.min(need) {
+    // Intersect the calendars, then read every series on those dates.
+    let mut common: Vec<NaiveDate> = match dated.first() {
+        Some(first) => first.iter().map(|(d, _)| *d).collect(),
+        None => Vec::new(),
+    };
+    common.sort_unstable();
+    common.dedup();
+    for series in dated.iter().skip(1) {
+        let have: HashSet<NaiveDate> = series.iter().map(|(d, _)| *d).collect();
+        common.retain(|d| have.contains(d));
+    }
+    if common.len() > need {
+        let start = common.len() - need;
+        common.drain(..start);
+    }
+    if common.len() < MIN_FACTOR_OBSERVATIONS.min(need) {
         let culprit = drivers
             .iter()
             .copied()
@@ -620,12 +662,14 @@ fn build_factor_matrix(
         return Err(RiskError::InsufficientHistory(
             culprit,
             u32::try_from(MIN_FACTOR_OBSERVATIONS).unwrap_or(u32::MAX),
-            common,
+            common.len(),
         ));
     }
-    for series in &mut matrix {
-        let start = series.len() - common;
-        series.drain(..start);
+
+    let mut matrix: Vec<Vec<f64>> = Vec::with_capacity(dated.len());
+    for series in &dated {
+        let by_date: HashMap<NaiveDate, f64> = series.iter().copied().collect();
+        matrix.push(common.iter().map(|d| by_date[d]).collect());
     }
 
     for asset in assets.iter_mut() {
@@ -842,6 +886,154 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // The factor panel: does it join the calendars it is given?
+    // ------------------------------------------------------------------
+
+    mod factor_panel {
+        use super::*;
+        use crate::historical_price::StaticHistoricalPriceProvider;
+
+        fn dec(x: f64) -> Decimal {
+            Decimal::from_f64(x).unwrap_or(Decimal::ZERO).round_dp(6)
+        }
+
+        const SESSIONS: usize = 400;
+        /// Every 21st session is followed by a day the market was shut.
+        const HOLIDAY_EVERY: usize = 21;
+
+        fn rng() -> impl FnMut() -> f64 {
+            let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+            #[allow(clippy::cast_precision_loss)]
+            move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 11) as f64 / 9_007_199_254_740_992.0 - 0.5
+            }
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        fn corr(a: &[f64], b: &[f64]) -> f64 {
+            let n = a.len() as f64;
+            let ma = a.iter().sum::<f64>() / n;
+            let mb = b.iter().sum::<f64>() / n;
+            let cov: f64 = a.iter().zip(b).map(|(x, y)| (x - ma) * (y - mb)).sum();
+            let va: f64 = a.iter().map(|x| (x - ma).powi(2)).sum::<f64>().sqrt();
+            let vb: f64 = b.iter().map(|y| (y - mb).powi(2)).sum::<f64>().sqrt();
+            cov / (va * vb)
+        }
+
+        /// Two strongly correlated drivers, where one feed also emits a flat
+        /// row on every market holiday and the other does not.
+        ///
+        /// This is the shape of the real defect. The vendor gave NVDA a close
+        /// on Thanksgiving and SOXX none, so over one year NVDA carried 13
+        /// rows its index did not. Lining the two up by position — last row
+        /// against last row — slides one series against the other by up to 13
+        /// sessions, and a true correlation near 0.6 is estimated as 0.04.
+        /// Nothing downstream looks wrong: the panel still produces a
+        /// believable VaR, it just no longer knows that an index put offsets
+        /// a single-name position, so a hedge is reported as a contributor.
+        #[test]
+        fn joins_drivers_by_date_not_position() {
+            let mut rnd = rng();
+            let clean = InstrumentId::new();
+            let ragged = InstrumentId::new();
+            let start = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+
+            let mut hist = StaticHistoricalPriceProvider::new();
+            let (mut p_clean, mut p_ragged) = (100.0_f64, 50.0_f64);
+            let mut truth_clean = Vec::new();
+            let mut truth_ragged = Vec::new();
+            let mut day = 0_i64;
+            let mut last_session = start;
+
+            for i in 0..SESSIONS {
+                let date = start + chrono::Duration::days(day);
+                // A shared component plus independent noise: correlated, but
+                // not singular, so the covariance stays positive definite.
+                let common = 0.02 * rnd();
+                let (ra, rb) = (common + 0.010 * rnd(), common + 0.010 * rnd());
+                p_clean *= ra.exp();
+                p_ragged *= rb.exp();
+                hist.insert(clean, date, Money::new(dec(p_clean), Currency::USD));
+                hist.insert(ragged, date, Money::new(dec(p_ragged), Currency::USD));
+                if i > 0 {
+                    truth_clean.push(ra);
+                    truth_ragged.push(rb);
+                }
+                last_session = date;
+                day += 1;
+
+                // The market is shut the next day. Only the ragged feed emits
+                // a row, repeating the previous close, exactly as the real
+                // one does.
+                if i % HOLIDAY_EVERY == HOLIDAY_EVERY - 1 {
+                    let holiday = start + chrono::Duration::days(day);
+                    hist.insert(ragged, holiday, Money::new(dec(p_ragged), Currency::USD));
+                    day += 1;
+                }
+            }
+
+            let truth = corr(&truth_clean, &truth_ragged);
+            assert!(truth > 0.5, "fixture is not correlated enough: {truth:.4}");
+
+            let drivers = vec![clean, ragged];
+            let panel = build_factor_matrix(
+                &drivers,
+                &mut [],
+                &hist,
+                &no_surfaces(),
+                252,
+                last_session,
+            )
+            .expect("panel");
+
+            assert_eq!(panel.len(), 2);
+            assert_eq!(panel[0].len(), panel[1].len());
+            let got = corr(&panel[0], &panel[1]);
+            assert!(
+                (got - truth).abs() < 0.12,
+                "panel correlation {got:.4} should track the true {truth:.4}; \
+                 a positional join collapses it toward zero"
+            );
+        }
+
+        /// The panel must never contain a date one of the drivers is missing.
+        #[test]
+        fn panel_is_the_intersection_of_the_calendars() {
+            let mut rnd = rng();
+            let a = InstrumentId::new();
+            let b = InstrumentId::new();
+            let start = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+            let mut hist = StaticHistoricalPriceProvider::new();
+            let mut px = 100.0_f64;
+
+            for i in 0..SESSIONS {
+                let date = start + chrono::Duration::days(i64::try_from(i).unwrap());
+                px *= (0.02 * rnd()).exp();
+                hist.insert(a, date, Money::new(dec(px), Currency::USD));
+                // `b` trades every other day, so the shared calendar is far
+                // thinner than `a`'s and thinner than the lookback asks for.
+                if i % 2 == 0 {
+                    hist.insert(b, date, Money::new(dec(px * 0.5), Currency::USD));
+                }
+            }
+            let as_of = start + chrono::Duration::days(i64::try_from(SESSIONS - 1).unwrap());
+            let panel =
+                build_factor_matrix(&[a, b], &mut [], &hist, &no_surfaces(), 252, as_of)
+                    .expect("panel");
+            // `b` has 200 rows and so 199 returns; every one of those dates
+            // is also in `a`, so the intersection is exactly 199 — short of
+            // the 252 the lookback asked for, which is the honest answer
+            // rather than 252 rows of mismatched days.
+            assert_eq!(panel[0].len(), 199, "intersection should be b's calendar");
+            assert!(panel[0].len() >= MIN_FACTOR_OBSERVATIONS);
+            assert_eq!(panel[0].len(), panel[1].len());
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Options: economic assertions, not numerical ones.
     // ------------------------------------------------------------------
 
@@ -887,7 +1079,11 @@ mod tests {
             (returns, scores)
         }
 
-        fn surface(spot: f64, scores: Vec<Vec<f64>>) -> SurfaceSnapshot {
+        fn surface(
+            spot: f64,
+            scores: Vec<Vec<f64>>,
+            score_sessions: Vec<NaiveDate>,
+        ) -> SurfaceSnapshot {
             let slices: Vec<FittedSlice> = TAUS
                 .iter()
                 .map(|&t| {
@@ -927,6 +1123,7 @@ mod tests {
                     explained: vec![1.0],
                     scores,
                 },
+                score_sessions,
             }
         }
 
@@ -950,13 +1147,14 @@ mod tests {
             let mut hist = StaticHistoricalPriceProvider::new();
             let mut px = SPOT;
             hist.insert(under, start, Money::new(dec(px), Currency::USD));
+            // A return is dated by the day it was earned, so the score series
+            // carries those same dates and the two join cleanly.
+            let mut sessions = Vec::with_capacity(returns.len());
             for (i, r) in returns.iter().enumerate() {
                 px *= r.exp();
-                hist.insert(
-                    under,
-                    start + chrono::Duration::days(i64::try_from(i).unwrap_or(0) + 1),
-                    Money::new(dec(px), Currency::USD),
-                );
+                let date = start + chrono::Duration::days(i64::try_from(i).unwrap_or(0) + 1);
+                sessions.push(date);
+                hist.insert(under, date, Money::new(dec(px), Currency::USD));
             }
             let as_of =
                 start + chrono::Duration::days(i64::try_from(returns.len()).unwrap_or(0));
@@ -972,7 +1170,7 @@ mod tests {
                 // moneyness -- which is a real failure mode, not just a test
                 // detail.
                 surfaces: crate::surface::StaticVolSurfaceProvider::new()
-                    .with(under, surface(px, scores)),
+                    .with(under, surface(px, scores, sessions)),
                 under,
                 as_of,
                 spot_now: px,

@@ -141,6 +141,8 @@ pub fn run(
             slices: sessions[&today].slices.clone(),
             cells: cells.iter().map(|c| Cell { z: unkey(c.1), tte: unkey(c.0) }).collect(),
             pca,
+            // The panel rows are exactly this window, in this order.
+            score_sessions: usable[i - FIT_WINDOW + 1..=i].to_vec(),
         };
         let Some(spot) = snapshot.forward(book.option_tenor) else { continue };
         let strike = (spot / 5.0).round() * 5.0;
@@ -208,6 +210,7 @@ pub fn run(
             slices: next.slices.clone(),
             cells: Vec::new(),
             pca: snapshot.pca.clone(),
+            score_sessions: snapshot.score_sessions.clone(),
         };
         let Some(next_spot) = next_snapshot.forward(book.option_tenor) else { continue };
         let Some(next_premium) = next_snapshot.price_contract(

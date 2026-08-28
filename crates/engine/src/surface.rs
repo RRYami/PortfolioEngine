@@ -31,6 +31,14 @@ pub struct SurfaceSnapshot {
     /// Grid cells, in the factor model's column order.
     pub cells: Vec<Cell>,
     pub pca: PcaFit,
+    /// Session date of each row in `pca.scores`, ascending and the same length.
+    ///
+    /// The scores are a time series and have to be joined to spot returns by
+    /// date, not by position: the surface is fitted only on sessions with a
+    /// usable chain, so it skips days the price history keeps. Without these
+    /// dates the two series get aligned on their tails, which slides the whole
+    /// vol factor against spot and destroys the leverage effect.
+    pub score_sessions: Vec<NaiveDate>,
 }
 
 impl SurfaceSnapshot {

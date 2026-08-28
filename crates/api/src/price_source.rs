@@ -209,15 +209,13 @@ impl PriceSource for ParquetPriceSource {
                 }
             }
 
-            // Remapped view, aligned with the price history's synthetic
-            // calendar days so the equity curve joins FX correctly.
-            let take = series.len().min(need);
-            let recent = &series[series.len() - take..];
-            let k = recent.len();
-            for (i, &(d, usd)) in recent.iter().enumerate() {
-                let offset = i64::try_from(k - 1 - i).unwrap_or(0);
+            // Same true-dated view: the price history is dated by real
+            // session now, so there is no synthetic calendar left to remap
+            // onto. Lookup forward-fills from the most recent rate on or
+            // before the date, which covers sessions the FX feed skips.
+            for &(d, usd) in series {
                 if let Some(b) = lookup(base_series, d) {
-                    fx.insert(*c, base, as_of - Duration::days(offset), dec(usd / b));
+                    fx.insert(*c, base, d, dec(usd / b));
                 }
             }
         }
@@ -231,13 +229,15 @@ impl PriceSource for ParquetPriceSource {
             })?;
             let take = series.len().min(need);
             let recent = &series[series.len() - take..];
-            let k = recent.len();
-            for (i, &close) in recent.iter().enumerate() {
-                let offset = i64::try_from(k - 1 - i).unwrap_or(0);
-                let date = as_of - Duration::days(offset);
+            // Inserted at the date the close actually belongs to. Restamping
+            // them onto consecutive calendar days back from `as_of` used to
+            // manufacture agreement between symbols that have different
+            // numbers of rows, which silently sheared one series against
+            // another and drove every estimated correlation to zero.
+            for &(date, close) in recent {
                 historical.insert(h.id, date, Money::new(dec(close), h.currency));
             }
-            if let Some(&last) = recent.last() {
+            if let Some(&(_, last)) = recent.last() {
                 prices.insert(h.id, as_of, Money::new(dec(last), h.currency));
             }
         }
@@ -251,23 +251,36 @@ impl PriceSource for ParquetPriceSource {
     }
 }
 
-fn read_prices(path: &Path) -> Result<HashMap<String, Vec<f64>>, ApiError> {
+/// Closes keyed by symbol, each ascending in date.
+///
+/// The dates are carried through rather than dropped. Two symbols do not
+/// share a calendar — a vendor emits a row on a market holiday for one ticker
+/// and not another — so a bare `Vec<f64>` cannot be joined to anything without
+/// assuming an alignment that is not there.
+fn read_prices(path: &Path) -> Result<HashMap<String, Vec<(NaiveDate, f64)>>, ApiError> {
     let file = File::open(path).map_err(|_| {
         ApiError::BadRequest("price data unavailable — add a holding to fetch prices".into())
     })?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .and_then(ParquetRecordBatchReaderBuilder::build)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let mut map: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut map: HashMap<String, Vec<(NaiveDate, f64)>> = HashMap::new();
     for batch in reader {
         let batch = batch.map_err(|e| ApiError::Internal(e.to_string()))?;
         let sym = col_str(&batch, "symbol")?;
+        let date = col_str(&batch, "date")?;
         let close = col_f64(&batch, "close")?;
         for i in 0..batch.num_rows() {
+            let Ok(d) = NaiveDate::parse_from_str(date.value(i), "%Y-%m-%d") else {
+                continue;
+            };
             map.entry(sym.value(i).to_string())
                 .or_default()
-                .push(close.value(i));
+                .push((d, close.value(i)));
         }
+    }
+    for series in map.values_mut() {
+        series.sort_by_key(|(d, _)| *d);
     }
     Ok(map)
 }
