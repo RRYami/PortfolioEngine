@@ -50,8 +50,12 @@ pub struct PriceData {
 }
 
 /// Supplies price/FX data for a set of holdings as of a date.
+///
+/// Async because a database-backed source has to be: the file-backed ones do
+/// no awaiting and simply return.
+#[async_trait::async_trait]
 pub trait PriceSource: Send + Sync {
-    fn build(
+    async fn build(
         &self,
         holdings: &[HeldInstrument],
         base: Currency,
@@ -77,8 +81,9 @@ const SUPPORTED: [&str; 5] = ["USD", "EUR", "GBP", "JPY", "CHF"];
 #[derive(Default)]
 pub struct SyntheticPriceSource;
 
+#[async_trait::async_trait]
 impl PriceSource for SyntheticPriceSource {
-    fn build(
+    async fn build(
         &self,
         holdings: &[HeldInstrument],
         base: Currency,
@@ -150,8 +155,9 @@ impl ParquetPriceSource {
     }
 }
 
+#[async_trait::async_trait]
 impl PriceSource for ParquetPriceSource {
-    fn build(
+    async fn build(
         &self,
         holdings: &[HeldInstrument],
         base: Currency,
@@ -349,8 +355,8 @@ mod tests {
     use super::*;
     use ptf_engine::{HistoricalPriceProvider, InstrumentId, PriceProvider};
 
-    #[test]
-    fn synthetic_supplies_enough_history_for_lookback() {
+    #[tokio::test]
+    async fn synthetic_supplies_enough_history_for_lookback() {
         let lookback = 252u32;
         let as_of = NaiveDate::from_ymd_opt(2026, 6, 26).unwrap();
         let id = InstrumentId::new();
@@ -363,6 +369,7 @@ mod tests {
 
         let pd = SyntheticPriceSource
             .build(&holdings, Currency::USD, as_of, lookback)
+            .await
             .unwrap();
 
         // compute_var needs >= lookback + 1 observations in [from, as_of].
@@ -402,5 +409,147 @@ impl Mulberry32 {
         }
         let v = self.next_f64();
         (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+    }
+}
+
+/// Prices and FX from Postgres.
+///
+/// Reads only what the request needs. The file-backed source loads every
+/// symbol's entire history on every call and then discards almost all of it;
+/// here the window and the symbol set are predicates, so a book of three
+/// tickers reads three tickers.
+pub struct PostgresPriceSource {
+    pool: sqlx::PgPool,
+}
+
+impl PostgresPriceSource {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl PriceSource for PostgresPriceSource {
+    async fn build(
+        &self,
+        holdings: &[HeldInstrument],
+        base: Currency,
+        as_of: NaiveDate,
+        lookback_days: u32,
+    ) -> Result<PriceData, ApiError> {
+        use sqlx::Row;
+
+        let mut historical = StaticHistoricalPriceProvider::new();
+        let mut prices = StaticPriceProvider::new();
+        let mut fx = HistoricalFxProvider::new();
+        let mut fx_trade_date = HistoricalFxProvider::new();
+
+        let need = i64::from(lookback_days) + 1;
+        let symbols: Vec<String> = holdings.iter().map(|h| h.symbol.clone()).collect();
+
+        // The most recent `need` sessions per symbol, at or before `as_of`.
+        // Ranking inside the database rather than fetching everything and
+        // trimming in Rust is the point of moving this here.
+        let rows = sqlx::query(
+            "SELECT symbol, session_date, close FROM (
+               SELECT symbol, session_date, close,
+                      row_number() OVER (PARTITION BY symbol
+                                         ORDER BY session_date DESC) AS rn
+               FROM market.equity_close
+               WHERE symbol = ANY($1) AND session_date <= $2
+             ) t
+             WHERE rn <= $3
+             ORDER BY symbol, session_date",
+        )
+        .bind(&symbols)
+        .bind(as_of)
+        .bind(need)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        let mut by_symbol: HashMap<String, Vec<(NaiveDate, f64)>> = HashMap::new();
+        for row in &rows {
+            let symbol: String = row.get("symbol");
+            let date: NaiveDate = row.get("session_date");
+            let close: f64 = row.get("close");
+            by_symbol.entry(symbol).or_default().push((date, close));
+        }
+
+        for h in holdings {
+            let series = by_symbol.get(&h.symbol).ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "no price data for {} — add it again to fetch",
+                    h.symbol
+                ))
+            })?;
+            // Dated by the session the close belongs to, so that series from
+            // sources with different calendars still join correctly.
+            for &(date, close) in series {
+                historical.insert(h.id, date, Money::new(dec(close), h.currency));
+            }
+            if let Some(&(_, last)) = series.last() {
+                prices.insert(h.id, as_of, Money::new(dec(last), h.currency));
+            }
+        }
+
+        // FX for every currency the table knows, not just those held today:
+        // cash balances and realized P&L outlive the position that created
+        // them and still need converting.
+        let fx_rows = sqlx::query(
+            "SELECT ccy, rate_date, usd_per_unit FROM market.fx_rate
+             ORDER BY ccy, rate_date",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        let mut fxmap: HashMap<String, Vec<(NaiveDate, f64)>> = HashMap::new();
+        for row in &fx_rows {
+            let ccy: String = row.get("ccy");
+            let date: NaiveDate = row.get("rate_date");
+            let usd: f64 = row.get("usd_per_unit");
+            fxmap.entry(ccy.trim().to_string()).or_default().push((date, usd));
+        }
+
+        let mut needed: Vec<Currency> = holdings.iter().map(|h| h.currency).collect();
+        needed.push(base);
+        needed.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        needed.dedup();
+        for c in &needed {
+            if !fxmap.contains_key(c.as_str()) {
+                return Err(ApiError::BadRequest(format!(
+                    "no FX data for {c} — run the prices service to refresh rates"
+                )));
+            }
+        }
+
+        let base_series = fxmap[base.as_str()].clone();
+        let mut available: Vec<Currency> = fxmap
+            .keys()
+            .filter_map(|c| Currency::try_from(c.as_str()).ok())
+            .collect();
+        available.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        available.dedup();
+
+        for c in &available {
+            if *c == base {
+                continue; // identity, handled by the trait
+            }
+            for &(d, usd) in &fxmap[c.as_str()] {
+                if let Some(b) = lookup(&base_series, d) {
+                    let rate = dec(usd / b);
+                    fx_trade_date.insert(*c, base, d, rate);
+                    fx.insert(*c, base, d, rate);
+                }
+            }
+        }
+
+        Ok(PriceData {
+            historical,
+            prices,
+            fx,
+            fx_trade_date,
+        })
     }
 }

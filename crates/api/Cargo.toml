@@ -33,6 +33,7 @@ tower-sessions-sqlx-store = { version = "0.15.0", features = ["postgres"] }
 password-auth = "1.0.0"
 tower-governor = { version = "0.8.0", package = "tower_governor" }
 sqlx = { workspace = true }
+async-trait = { workspace = true }
 tower_governor = "0.8.0"
 
 [dev-dependencies]

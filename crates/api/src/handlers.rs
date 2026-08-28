@@ -448,7 +448,7 @@ async fn get_risk(
     let as_of = Utc::now().date_naive();
     let lookback = ptf_engine::MonteCarloConfig::default_var().lookback_days;
     let (pd, surfaces) =
-        build_prices(&app, &holdings, portfolio.base_currency, as_of, lookback)?;
+        build_prices(&app, &holdings, portfolio.base_currency, as_of, lookback).await?;
     let payload =
         risk_view::build(&portfolio, &state, &holdings, &names, &pd, &surfaces, as_of)?;
     Ok(Json(payload))
@@ -469,7 +469,7 @@ async fn get_positions(
     // sources have a valid window to source the latest close from.
     let lookback = ptf_engine::MonteCarloConfig::default_var().lookback_days;
     let (pd, _surfaces) =
-        build_prices(&app, &holdings, portfolio.base_currency, as_of, lookback)?;
+        build_prices(&app, &holdings, portfolio.base_currency, as_of, lookback).await?;
     let payload = positions_view::build(&portfolio, &state, &holdings, &names, &pd, as_of)?;
     Ok(Json(payload))
 }
@@ -498,7 +498,7 @@ async fn get_performance(
     // Options are marked from the surface here too, so the performance page
     // values the same book the positions page does.
     let (pd, _surfaces) =
-        build_prices(&app, &holdings, portfolio.base_currency, as_of, lookback)?;
+        build_prices(&app, &holdings, portfolio.base_currency, as_of, lookback).await?;
 
     // Benchmark is best-effort: if it can't be fetched/priced we still return the
     // self-contained ratios, just without the `relative` block.
@@ -554,7 +554,7 @@ async fn benchmark_series(
         currency: Currency::USD,
         kind: InstrumentKind::Equity {},
     }];
-    let Ok(pd) = app.prices.build(&holdings, base, as_of, lookback) else {
+    let Ok(pd) = app.prices.build(&holdings, base, as_of, lookback).await else {
         return Ok(None);
     };
     let fx = pd
@@ -630,7 +630,7 @@ async fn gather_holdings(
 /// listed contract has no row in the price file and never will, so asking for
 /// one is an error by construction. Their underlyings are still in the list,
 /// which is what the risk run actually needs.
-fn build_prices(
+async fn build_prices(
     app: &AppState,
     holdings: &[HeldInstrument],
     base: Currency,
@@ -642,7 +642,7 @@ fn build_prices(
         .filter(|h| !h.kind.is_derivative())
         .cloned()
         .collect();
-    let mut pd = app.prices.build(&feed, base, as_of, lookback)?;
+    let mut pd = app.prices.build(&feed, base, as_of, lookback).await?;
     let surfaces = mark_options(holdings, &mut pd, as_of);
     Ok((pd, surfaces))
 }

@@ -75,20 +75,42 @@ async fn storage() -> Storage {
     }
 }
 
-/// Build the price source from env. `PTF_PRICES=parquet` reads the Python
-/// service's Parquet export (with ensure-on-add via `PRICES_URL`); otherwise a
-/// deterministic synthetic feed is used.
-fn price_source() -> (Arc<dyn PriceSource>, Option<String>) {
-    if std::env::var("PTF_PRICES").as_deref() == Ok("parquet") {
+/// Build the price source from env.
+///
+/// `PTF_PRICES=postgres` reads `market.equity_close` and `market.fx_rate`,
+/// which is the only source that filters by symbol and window in the query
+/// rather than loading every symbol's whole history per request. It needs a
+/// database, so it falls back to the Parquet export when there is none.
+/// `PTF_PRICES=parquet` reads the Python service's export directly; anything
+/// else is a deterministic synthetic feed.
+fn price_source(pool: Option<&sqlx::PgPool>) -> (Arc<dyn PriceSource>, Option<String>) {
+    let url = || std::env::var("PRICES_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".into());
+    if std::env::var("PTF_PRICES").as_deref() == Ok("postgres") {
+        if let Some(pool) = pool {
+            let url = url();
+            tracing::info!("prices: postgres (market.equity_close), ensure via {url}");
+            return (
+                Arc::new(price_source::PostgresPriceSource::new(pool.clone())),
+                Some(url),
+            );
+        }
+        tracing::warn!(
+            "PTF_PRICES=postgres but DATABASE_URL is unset — falling back to parquet"
+        );
+    }
+    if matches!(
+        std::env::var("PTF_PRICES").as_deref(),
+        Ok("parquet" | "postgres")
+    ) {
         let prices = std::env::var("PRICES_PARQUET")
             .unwrap_or_else(|_| "services/prices/data/prices.parquet".into());
         let fx = std::env::var("FX_PARQUET")
             .unwrap_or_else(|_| "services/prices/data/fx.parquet".into());
-        let url = std::env::var("PRICES_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".into());
+        let url = url();
         tracing::info!("prices: parquet ({prices}), ensure via {url}");
         (Arc::new(ParquetPriceSource::new(prices, fx)), Some(url))
     } else {
-        tracing::info!("prices: synthetic (set PTF_PRICES=parquet for yfinance)");
+        tracing::info!("prices: synthetic (set PTF_PRICES=postgres for real data)");
         (Arc::new(SyntheticPriceSource), None)
     }
 }
@@ -107,7 +129,7 @@ async fn main() {
         .init();
 
     let storage = storage().await;
-    let (prices, prices_url) = price_source();
+    let (prices, prices_url) = price_source(storage.pool.as_ref());
     let registration_open = !env_flag("PTF_DISABLE_REGISTRATION");
     // Secure cookies need TLS; off by default for local HTTP dev.
     let secure_cookies = env_flag("PTF_SECURE_COOKIES");

@@ -2123,6 +2123,7 @@ name = "ptf-api"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "axum",
  "axum-login",
  "chrono",
