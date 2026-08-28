@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import type { PortfolioSummary } from "@/app/lib/portfolioTypes";
 import {
   AddHoldingDialog,
+  AddOptionDialog,
   NewPortfolioDialog,
 } from "@/app/components/PortfolioDialogs";
 import RiskDashboard from "./RiskDashboard";
@@ -47,6 +48,7 @@ export default function AppShell() {
   const [page, setPage] = useState<Page>("positions");
   const [newOpen, setNewOpen] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  const [optionOpen, setOptionOpen] = useState(false);
   const [refreshToken, setRefreshToken] = useState(0);
 
   const loadPortfolios = useCallback(() => {
@@ -105,6 +107,13 @@ export default function AppShell() {
         defaultDate={selected?.inceptionDate}
         onAdded={() => setRefreshToken((t) => t + 1)}
       />
+      <AddOptionDialog
+        open={optionOpen}
+        onOpenChange={setOptionOpen}
+        portfolioId={selectedId}
+        defaultDate={selected?.inceptionDate}
+        onAdded={() => setRefreshToken((t) => t + 1)}
+      />
     </>
   );
 
@@ -152,6 +161,7 @@ export default function AppShell() {
     selected,
     refreshToken,
     onAddHolding: () => setAddOpen(true),
+    onAddOption: () => setOptionOpen(true),
   };
 
   return (

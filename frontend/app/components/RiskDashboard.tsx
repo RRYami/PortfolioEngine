@@ -184,6 +184,7 @@ export interface RiskDashboardProps {
   /** Bumped by the shell when a holding is added, to trigger a refetch. */
   refreshToken: number;
   onAddHolding: () => void;
+  onAddOption: () => void;
 }
 
 export default function RiskDashboard({
@@ -191,6 +192,7 @@ export default function RiskDashboard({
   selected,
   refreshToken,
   onAddHolding,
+  onAddOption,
 }: RiskDashboardProps) {
   const [payload, setPayload] = useState<RiskPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -368,6 +370,22 @@ export default function RiskDashboard({
                 <span>
                   This book has no holdings yet — add one to see live analytics.
                 </span>
+                <Button
+                  onClick={onAddOption}
+                  className="h-auto"
+                  style={{
+                    flexShrink: 0,
+                    padding: "7px 13px",
+                    borderRadius: 9,
+                    background: "transparent",
+                    color: "var(--accent)",
+                    border: "1px solid rgba(99,102,241,.45)",
+                    fontWeight: 700,
+                    fontSize: 12,
+                  }}
+                >
+                  ＋ Option
+                </Button>
                 <Button
                   onClick={onAddHolding}
                   className="h-auto"

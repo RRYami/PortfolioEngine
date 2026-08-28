@@ -15,6 +15,7 @@ export interface PositionsPageProps {
   selected: PortfolioSummary | null;
   refreshToken: number;
   onAddHolding: () => void;
+  onAddOption: () => void;
 }
 
 export default function PositionsPage({
@@ -22,6 +23,7 @@ export default function PositionsPage({
   selected,
   refreshToken,
   onAddHolding,
+  onAddOption,
 }: PositionsPageProps) {
   const [data, setData] = useState<PositionsPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -75,22 +77,40 @@ export default function PositionsPage({
             </div>
           </div>
         )}
-        <Button
-          onClick={onAddHolding}
-          className="h-auto"
-          style={{
-            padding: "8px 14px",
-            borderRadius: 10,
-            background: "var(--accent)",
-            color: "#fff",
-            fontWeight: 700,
-            fontSize: 12.5,
-            boxShadow: "0 6px 18px rgba(99,102,241,.35)",
-            cursor: "pointer",
-          }}
-        >
-          ＋ Add Holding
-        </Button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <Button
+            onClick={onAddOption}
+            className="h-auto"
+            style={{
+              padding: "8px 14px",
+              borderRadius: 10,
+              background: "transparent",
+              color: "var(--accent)",
+              border: "1px solid rgba(99,102,241,.45)",
+              fontWeight: 700,
+              fontSize: 12.5,
+              cursor: "pointer",
+            }}
+          >
+            ＋ Option
+          </Button>
+          <Button
+            onClick={onAddHolding}
+            className="h-auto"
+            style={{
+              padding: "8px 14px",
+              borderRadius: 10,
+              background: "var(--accent)",
+              color: "#fff",
+              fontWeight: 700,
+              fontSize: 12.5,
+              boxShadow: "0 6px 18px rgba(99,102,241,.35)",
+              cursor: "pointer",
+            }}
+          >
+            ＋ Add Holding
+          </Button>
+        </div>
       </div>
     </div>
   );

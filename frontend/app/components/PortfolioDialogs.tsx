@@ -281,6 +281,187 @@ export function AddHoldingDialog({
   );
 }
 
+
+/** Shares per contract for a standard listed option. */
+const CONTRACT_MULTIPLIER = 100;
+
+export function AddOptionDialog({
+  open,
+  onOpenChange,
+  portfolioId,
+  defaultDate,
+  onAdded,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  portfolioId: string | null;
+  defaultDate?: string;
+  onAdded: () => void;
+}) {
+  const today = new Date().toISOString().slice(0, 10);
+  const [underlying, setUnderlying] = useState("");
+  const [right, setRight] = useState("call");
+  const [strike, setStrike] = useState("");
+  const [expiry, setExpiry] = useState("");
+  const [contracts, setContracts] = useState("");
+  const [premium, setPremium] = useState("");
+  const [currency, setCurrency] = useState("USD");
+  // Derived rather than synced from an effect: the trade date defaults to the
+  // portfolio's inception and only becomes state once the user edits it, so a
+  // change to `defaultDate` flows through without a render cascade.
+  const [dateEdit, setDateEdit] = useState<string | null>(null);
+  const date = dateEdit ?? defaultDate ?? today;
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Premiums are quoted per share but a contract covers a hundred of them, so
+  // the total is shown as it is typed. That factor of a hundred is the easiest
+  // thing in the whole form to get wrong.
+  const n = Number(contracts);
+  const p = Number(premium);
+  const total =
+    n > 0 && p > 0 ? n * p * CONTRACT_MULTIPLIER : null;
+
+  const submit = async () => {
+    if (!portfolioId) return;
+    const k = Number(strike);
+    if (!underlying.trim()) return setError("Underlying ticker is required");
+    if (!(k > 0)) return setError("Strike must be positive");
+    if (!expiry) return setError("Expiry is required");
+    if (!(n > 0))
+      return setError("Contracts must be positive — writing options is not supported");
+    if (!(p > 0)) return setError("Premium must be positive");
+    if (!date) return setError("Trade date is required");
+    if (expiry <= date) return setError("Expiry must be after the trade date");
+    setBusy(true);
+    setError(null);
+    try {
+      await postJson(`/api/portfolios/${portfolioId}/options`, {
+        underlying: underlying.trim().toUpperCase(),
+        right,
+        strike: k,
+        expiry,
+        contracts: n,
+        premium: p,
+        currency,
+        date,
+      });
+      onAdded();
+      onOpenChange(false);
+      setUnderlying("");
+      setStrike("");
+      setExpiry("");
+      setContracts("");
+      setPremium("");
+      setDateEdit(null);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="dark">
+        <DialogHeader>
+          <DialogTitle>Add option</DialogTitle>
+          <DialogDescription>
+            Priced and risked through the fitted volatility surface for the
+            underlying, which must already have one.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col gap-3 py-1">
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Underlying">
+              <Input
+                value={underlying}
+                onChange={(e) => setUnderlying(e.target.value)}
+                placeholder="SOXX"
+                autoFocus
+              />
+            </Field>
+            <Field label="Currency">
+              <CcySelect value={currency} onChange={setCurrency} />
+            </Field>
+          </div>
+          <div className="grid grid-cols-3 gap-3">
+            <Field label="Right">
+              <Select value={right} onValueChange={(v) => v && setRight(v)}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="dark">
+                  <SelectItem value="call">Call</SelectItem>
+                  <SelectItem value="put">Put</SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
+            <Field label="Strike">
+              <Input
+                type="number"
+                value={strike}
+                onChange={(e) => setStrike(e.target.value)}
+                placeholder="540"
+              />
+            </Field>
+            <Field label="Expiry">
+              <Input
+                type="date"
+                value={expiry}
+                min={date}
+                onChange={(e) => setExpiry(e.target.value)}
+              />
+            </Field>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Contracts">
+              <Input
+                type="number"
+                value={contracts}
+                onChange={(e) => setContracts(e.target.value)}
+                placeholder="2"
+              />
+            </Field>
+            <Field label="Premium / share">
+              <Input
+                type="number"
+                value={premium}
+                onChange={(e) => setPremium(e.target.value)}
+                placeholder="28.00"
+              />
+            </Field>
+          </div>
+          <Field label="Trade date">
+            <Input
+              type="date"
+              value={date}
+              max={today}
+              onChange={(e) => setDateEdit(e.target.value)}
+            />
+          </Field>
+          {total !== null && (
+            <p style={{ color: "#9aa1b2", fontSize: 12 }}>
+              {n} contract{n === 1 ? "" : "s"} &times; {ccySym(currency)}
+              {nf(p, 2)} &times; {CONTRACT_MULTIPLIER} shares ={" "}
+              <span style={{ color: "#e5e7eb", fontWeight: 600 }}>
+                {ccySym(currency)}
+                {nf(total, 2)}
+              </span>
+            </p>
+          )}
+          {error && <p className="text-sm text-red-400">{error}</p>}
+        </div>
+        <DialogFooter>
+          <Button onClick={submit} disabled={busy} style={accentBtn}>
+            {busy ? "Adding…" : "Add option"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export function SellHoldingDialog({
   open,
   onOpenChange,
