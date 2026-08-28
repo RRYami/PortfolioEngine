@@ -149,12 +149,20 @@ pub fn build(
 ) -> Result<RiskPayload, ApiError> {
     let base = portfolio.base_currency;
     let cfg = MonteCarloConfig::default_var();
-    // No options are modelled yet on this path: the API creates only equity
-    // instruments, so the kind map is empty and every position falls back to
-    // Equity. Wiring the real surfaces in is the next step, and doing it here
-    // is the only change this call site will need.
-    let kinds = std::collections::HashMap::new();
-    let surfaces = ptf_engine::StaticVolSurfaceProvider::new();
+    // Options are revalued through a surface rather than shocked directly, so
+    // the risk run needs both the instrument kinds and the fitted surfaces.
+    let kinds: std::collections::HashMap<_, _> =
+        holdings.iter().map(|h| (h.id, h.kind)).collect();
+    // Roots are matched by symbol: the surface artifacts are keyed by the
+    // underlying's ticker, which is what the ingest wrote.
+    let roots: std::collections::HashMap<String, ptf_engine::InstrumentId> =
+        holdings.iter().map(|h| (h.symbol.clone(), h.id)).collect();
+    let dir = std::env::var("PTF_SURFACES")
+        .unwrap_or_else(|_| "services/prices/data".into());
+    let files = crate::surface_source::SurfaceFiles::in_dir(std::path::Path::new(&dir));
+    // Loaded per request for now. The files are small, but this is the obvious
+    // thing to cache in AppState once an options book is actually held.
+    let surfaces = crate::surface_source::load(&files, &roots, as_of);
     let report = compute_var(
         state,
         &pd.historical,

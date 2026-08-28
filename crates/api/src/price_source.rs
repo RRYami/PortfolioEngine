@@ -24,6 +24,9 @@ pub struct HeldInstrument {
     pub id: InstrumentId,
     pub symbol: String,
     pub currency: Currency,
+    /// Equity or option. The risk path needs this to decide whether a position
+    /// is shocked directly or revalued through a surface.
+    pub kind: ptf_engine::InstrumentKind,
 }
 
 /// The providers `compute_var` / `valuation` require, fully populated.
@@ -341,6 +344,7 @@ mod tests {
             id,
             symbol: "NVDA".into(),
             currency: Currency::USD,
+            kind: ptf_engine::InstrumentKind::Equity {},
         }];
 
         let pd = SyntheticPriceSource

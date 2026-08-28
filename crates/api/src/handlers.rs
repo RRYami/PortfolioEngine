@@ -372,6 +372,7 @@ async fn benchmark_series(
         id: bid,
         symbol: symbol.to_string(),
         currency: Currency::USD,
+        kind: InstrumentKind::Equity {},
     }];
     let Ok(pd) = app.prices.build(&holdings, base, as_of, lookback) else {
         return Ok(None);
@@ -413,6 +414,7 @@ async fn gather_holdings(
                 id: inst.id,
                 symbol: inst.symbol,
                 currency: inst.currency,
+                kind: inst.kind,
             });
         }
     }

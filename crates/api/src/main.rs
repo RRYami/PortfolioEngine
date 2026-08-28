@@ -17,6 +17,7 @@ mod positions_view;
 mod price_source;
 mod risk_view;
 mod state;
+mod surface_source;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
