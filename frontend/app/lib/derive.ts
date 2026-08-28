@@ -63,20 +63,6 @@ export interface DerivedView {
     esV: number;
     deepV: number;
   };
-  dd: {
-    maxL: string;
-    series: number[];
-    /** ISO dates — the time scale parses these; tooltips format them. */
-    dates: string[];
-  };
-  histVar: {
-    cur1d: string;
-    cur20d: string;
-    v1d: number[];
-    v20d: number[];
-    /** ISO dates. */
-    dates: string[];
-  };
 }
 
 const round1 = (n: number) => Number(n.toFixed(1));
@@ -137,13 +123,6 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
       subColor: "#6b7280",
     },
     {
-      label: "Max Drawdown",
-      value: payload.drawdown.maxPct.toFixed(1) + "%",
-      valueColor: LOSS,
-      sub: "peak-to-trough",
-      subColor: "#6b7280",
-    },
-    {
       label: "Unrealized P&L",
       value:
         (payload.unrealizedPnl >= 0 ? "+" : MINUS) +
@@ -194,17 +173,6 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
   const var1dBoth = comp(-r.var1d, bc) + " (" + var1dPctS + ")";
   const es1dBoth = comp(-r.es1d, bc) + " (" + es1dPctS + ")";
 
-  // ---- Drawdown underwater curve ----
-  const ddSeries = payload.drawdown.series; // % from peak, ≤ 0
-  const maxDD = payload.drawdown.maxPct;
-
-  // ---- Historical VaR series ----
-  const v1d = payload.histVar.var1dPct[conf]; // positive %
-  const v20d = payload.histVar.var20dPct[conf];
-  // `?? 0` so a book with no holdings (empty series) doesn't crash on .toFixed.
-  const cur1dPct = v1d.at(-1) ?? 0;
-  const cur20dPct = v20d.at(-1) ?? 0;
-
   return {
     baseCcy: bc,
     confL,
@@ -225,22 +193,6 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
       varV: cut.var,
       esV: cut.es,
       deepV: cut.deep,
-    },
-    dd: {
-      maxL: maxDD.toFixed(1) + "%",
-      series: ddSeries,
-      dates: payload.drawdown.dates,
-    },
-    histVar: {
-      cur1d:
-        MINUS + comp((cur1dPct / 100) * tot, bc) + " · " + MINUS +
-        cur1dPct.toFixed(2) + "%",
-      cur20d:
-        MINUS + comp((cur20dPct / 100) * tot, bc) + " · " + MINUS +
-        cur20dPct.toFixed(2) + "%",
-      v1d,
-      v20d,
-      dates: payload.histVar.dates,
     },
   };
 }

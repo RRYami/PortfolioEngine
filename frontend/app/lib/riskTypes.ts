@@ -28,15 +28,6 @@ export interface Drawdown {
   series: number[];
 }
 
-export interface HistVar {
-  /** ISO dates, length N. */
-  dates: string[];
-  /** Rolling 1-day VaR as a positive %, per confidence; each length N. */
-  var1dPct: Record<Confidence, number[]>;
-  /** Rolling 20-day VaR (= var1d × √20) as a positive %, per confidence. */
-  var20dPct: Record<Confidence, number[]>;
-}
-
 export interface ComponentVar {
   ticker: string;
   /** Contribution to 1-day VaR (sums to var1d), base currency. */
@@ -90,8 +81,8 @@ export interface RiskPayload {
   /** 252-day realized, annualized %. */
   annVolPct: number;
   positions: Position[];
+  /** Still produced by the API; nothing in the dashboard reads it today. */
   drawdown: Drawdown;
-  histVar: HistVar;
   risk: Record<Confidence, RiskBlock>;
   pnlDistribution: PnlDistribution;
 }

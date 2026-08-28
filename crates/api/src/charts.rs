@@ -6,10 +6,9 @@
 //! - **Historical VaR** — rolling-window VaR from realized portfolio returns,
 //!   scaled so the latest point equals the headline VaR.
 
-use crate::risk_view::{ByConf, Cutoffs, Drawdown, HistVar, PnlDistribution};
+use crate::risk_view::{ByConf, Cutoffs, Drawdown, PnlDistribution};
 
 const BINS: usize = 43;
-const WINDOW: usize = 20;
 
 /// (var1d, es1d) at a confidence level.
 pub type Tail = (f64, f64);
@@ -97,61 +96,3 @@ pub fn drawdown(equity: &[f64], dates: &[String]) -> Drawdown {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
-pub fn historical_var(
-    equity: &[f64],
-    dates: &[String],
-    total: f64,
-    var1d95: f64,
-    var1d99: f64,
-) -> HistVar {
-    let n = equity.len();
-    let pct = |v: f64| if total == 0.0 { 0.0 } else { v / total * 100.0 };
-
-    // Log returns (index 0 is a zero placeholder, excluded from windows).
-    let mut rets = vec![0.0f64; n];
-    for i in 1..n {
-        rets[i] = if equity[i - 1] > 0.0 && equity[i] > 0.0 {
-            (equity[i] / equity[i - 1]).ln()
-        } else {
-            0.0
-        };
-    }
-
-    // Rolling realized vol → shape normalized so the latest point is 1.0.
-    let mut roll = vec![0.0f64; n];
-    for i in 1..n {
-        let start = i.saturating_sub(WINDOW - 1).max(1);
-        let win = &rets[start..=i];
-        let m: f64 = win.iter().sum::<f64>() / win.len() as f64;
-        let var: f64 =
-            win.iter().map(|r| (r - m) * (r - m)).sum::<f64>() / (win.len().max(2) - 1) as f64;
-        roll[i] = var.sqrt();
-    }
-    if n >= 2 {
-        roll[0] = roll[1];
-    }
-    let last = roll.last().copied().unwrap_or(0.0).max(1e-12);
-
-    let sqrt20 = 20.0_f64.sqrt();
-    let scaled = |var1d: f64| -> Vec<f64> {
-        let target = pct(var1d);
-        roll.iter().map(|r| r / last * target).collect()
-    };
-    let v1d95 = scaled(var1d95);
-    let v1d99 = scaled(var1d99);
-    let v20d95: Vec<f64> = v1d95.iter().map(|v| v * sqrt20).collect();
-    let v20d99: Vec<f64> = v1d99.iter().map(|v| v * sqrt20).collect();
-
-    HistVar {
-        dates: dates.to_vec(),
-        var1d_pct: ByConf {
-            c95: v1d95,
-            c99: v1d99,
-        },
-        var20d_pct: ByConf {
-            c95: v20d95,
-            c99: v20d99,
-        },
-    }
-}

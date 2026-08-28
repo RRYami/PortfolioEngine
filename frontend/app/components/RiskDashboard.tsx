@@ -4,11 +4,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import type { Confidence, RiskPayload } from "@/app/lib/riskTypes";
 import { derive, type DerivedView } from "@/app/lib/derive";
-import { comp, MINUS, shortDate } from "@/app/lib/format";
+import { comp } from "@/app/lib/format";
 import { getJson } from "@/app/lib/apiBase";
 import { place, type ChartHover } from "@/app/lib/chart/base";
-import DrawdownChart from "@/app/components/charts/DrawdownChart";
-import HistVarChart from "@/app/components/charts/HistVarChart";
 import PnlDistributionChart from "@/app/components/charts/PnlDistributionChart";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -24,7 +22,7 @@ import {
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import type { PortfolioSummary } from "@/app/lib/portfolioTypes";
 
-type ChartKind = "dist" | "hist" | "dd";
+type ChartKind = "dist";
 
 /** A `ChartHover` from one of the d3 charts, tagged with which chart sent it. */
 interface HoverState extends ChartHover {
@@ -83,47 +81,7 @@ function buildTip(v: DerivedView, conf: Confidence, h: HoverState): Tip | null {
     };
   }
 
-  if (h.chart === "hist") {
-    const { v1d, v20d, dates } = v.histVar;
-    return {
-      ...place(cx, py, w),
-      title: shortDate(dates[i]),
-      titleColor: "#c5cad6",
-      rows: [
-        {
-          k: "VaR 1-Day",
-          v:
-            MINUS + comp((v1d[i] / 100) * tot, bc) + " · " + MINUS +
-            v1d[i].toFixed(2) + "%",
-          c: "var(--accent)",
-        },
-        {
-          k: "VaR 20-Day",
-          v:
-            MINUS + comp((v20d[i] / 100) * tot, bc) + " · " + MINUS +
-            v20d[i].toFixed(2) + "%",
-          c: "var(--loss)",
-        },
-      ],
-    };
-  }
-
-  // drawdown
-  const { series, dates } = v.dd;
-  const d = series[i];
-  return {
-    ...place(cx, py, w),
-    title: shortDate(dates[i]),
-    titleColor: "#c5cad6",
-    rows: [
-      { k: "Drawdown", v: d.toFixed(2) + "%", c: "var(--loss)" },
-      {
-        k: "Depth",
-        v: MINUS + comp((Math.abs(d) / 100) * tot, bc),
-        c: "var(--loss)",
-      },
-    ],
-  };
+  return null;
 }
 
 function Tooltip({ tip }: { tip: Tip }) {
@@ -236,8 +194,6 @@ export default function RiskDashboard({
     [],
   );
   const onDistHover = useMemo(() => mkHover("dist"), [mkHover]);
-  const onDdHover = useMemo(() => mkHover("dd"), [mkHover]);
-  const onHistHover = useMemo(() => mkHover("hist"), [mkHover]);
 
   const segBase: CSSProperties = {
     padding: "5px 12px",
@@ -344,9 +300,6 @@ export default function RiskDashboard({
 
   const distTip =
     hover?.chart === "dist" ? buildTip(view, conf, hover) : null;
-  const histTip =
-    hover?.chart === "hist" ? buildTip(view, conf, hover) : null;
-  const ddTip = hover?.chart === "dd" ? buildTip(view, conf, hover) : null;
 
   return (
     <div style={{ flex: 1, padding: "18px 20px", minWidth: 0 }}>
@@ -548,35 +501,6 @@ export default function RiskDashboard({
                   </div>
                 </div>
 
-                {/* Drawdown */}
-                <div className="pe-panel" style={panelStyle}>
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "baseline",
-                      justifyContent: "space-between",
-                    }}
-                  >
-                    <div style={{ fontWeight: 700, fontSize: 13.5 }}>
-                      Drawdown — Underwater Curve
-                    </div>
-                    <div style={{ fontSize: 11, color: "#9aa1b2" }}>
-                      Max{" "}
-                      <span className="mono" style={{ color: "var(--loss)" }}>
-                        {view.dd.maxL}
-                      </span>
-                    </div>
-                  </div>
-                  <div style={{ position: "relative", marginTop: 12 }}>
-                    <DrawdownChart
-                      dates={view.dd.dates}
-                      series={view.dd.series}
-                      hoverIndex={hover?.chart === "dd" ? hover.i : null}
-                      onHover={onDdHover}
-                    />
-                    {ddTip && <Tooltip tip={ddTip} />}
-                  </div>
-                </div>
               </div>
 
               {/* right col */}
@@ -849,102 +773,6 @@ export default function RiskDashboard({
               </div>
             </div>
 
-            {/* Historical VaR */}
-            <div className="pe-panel" style={{ ...panelStyle, marginTop: 13 }}>
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "baseline",
-                  justifyContent: "space-between",
-                }}
-              >
-                <div style={{ fontWeight: 700, fontSize: 13.5 }}>
-                  Historical VaR — 1-Day &amp; 20-Day{" "}
-                  <span style={{ color: "var(--accent)", fontWeight: 600 }}>
-                    · {view.confL}
-                  </span>
-                </div>
-                <div
-                  style={{
-                    display: "flex",
-                    gap: 20,
-                    alignItems: "baseline",
-                  }}
-                >
-                  <div style={{ fontSize: 11, color: "#9aa1b2" }}>
-                    1-Day now{" "}
-                    <span className="mono" style={{ color: "var(--accent)" }}>
-                      {view.histVar.cur1d}
-                    </span>
-                  </div>
-                  <div style={{ fontSize: 11, color: "#9aa1b2" }}>
-                    20-Day now{" "}
-                    <span className="mono" style={{ color: "var(--loss)" }}>
-                      {view.histVar.cur20d}
-                    </span>
-                  </div>
-                </div>
-              </div>
-              <div style={{ position: "relative", marginTop: 12 }}>
-                <HistVarChart
-                  dates={view.histVar.dates}
-                  v1d={view.histVar.v1d}
-                  v20d={view.histVar.v20d}
-                  hoverIndex={hover?.chart === "hist" ? hover.i : null}
-                  onHover={onHistHover}
-                />
-                {histTip && <Tooltip tip={histTip} />}
-              </div>
-              <div style={{ display: "flex", gap: 18, marginTop: 11 }}>
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 7,
-                    fontSize: 11,
-                    color: "#9aa1b2",
-                  }}
-                >
-                  <span
-                    style={{
-                      width: 14,
-                      height: 3,
-                      borderRadius: 2,
-                      background: "var(--accent)",
-                    }}
-                  />
-                  VaR 1-Day
-                </div>
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 7,
-                    fontSize: 11,
-                    color: "#9aa1b2",
-                  }}
-                >
-                  <span
-                    style={{
-                      width: 14,
-                      height: 3,
-                      borderRadius: 2,
-                      background: "var(--loss)",
-                    }}
-                  />
-                  VaR 20-Day (√t scaled)
-                </div>
-                <div
-                  style={{
-                    fontSize: 11,
-                    color: "#6b7280",
-                    marginLeft: "auto",
-                  }}
-                >
-                  180 trading days · 20d rolling window
-                </div>
-              </div>
-            </div>
     </div>
   );
 }

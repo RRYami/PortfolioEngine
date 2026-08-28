@@ -18,14 +18,13 @@ import {
 } from "@/app/components/PortfolioDialogs";
 import RiskDashboard from "./RiskDashboard";
 import PositionsPage from "./PositionsPage";
-import PerformancePage from "./PerformancePage";
 
 interface SessionUser {
   id: string;
   email: string;
 }
 
-type Page = "positions" | "risk" | "performance";
+type Page = "positions" | "risk";
 
 interface NavItem {
   id: Page;
@@ -37,7 +36,6 @@ interface NavItem {
 const NAV: NavItem[] = [
   { id: "positions", label: "Positions", icon: "▤", hint: "Holdings & lots" },
   { id: "risk", label: "Risk", icon: "◈", hint: "VaR & stress" },
-  { id: "performance", label: "Performance", icon: "◎", hint: "Risk-adjusted ratios" },
 ];
 
 export default function AppShell() {
@@ -353,10 +351,8 @@ export default function AppShell() {
 
           {page === "positions" ? (
             <PositionsPage key={selectedId} {...pageProps} />
-          ) : page === "risk" ? (
-            <RiskDashboard key={selectedId} {...pageProps} />
           ) : (
-            <PerformancePage key={selectedId} {...pageProps} />
+            <RiskDashboard key={selectedId} {...pageProps} />
           )}
         </div>
       </div>

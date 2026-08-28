@@ -2,7 +2,7 @@
 //
 // This is the stand-in for the Rust analytics engine: it produces the raw
 // numbers described in the Data Contract. The math (seeded Monte-Carlo VaR/ES,
-// rolling-window historical VaR, underwater drawdown curve, component VaR) is
+// underwater drawdown curve, component VaR) is
 // ported verbatim from the design prototype's logic class so the rendered
 // dashboard matches the standalone reference exactly. In production this module
 // would call into the PortfolioEngine `Statistics`/VaR code instead.
@@ -132,19 +132,6 @@ export function computeRiskPayload(_portfolioId: string): RiskPayload {
   });
   const maxDD = Math.min(...ddFrac);
 
-  // Rolling 20-day realized vol of the daily returns.
-  const Wv = 20;
-  const rollSd: number[] = [];
-  for (let t = 0; t < Nd; t++) {
-    const s0 = Math.max(0, t - Wv);
-    const win = rs.slice(s0, t + 1);
-    const m = win.reduce((a, b) => a + b, 0) / win.length;
-    let vc = 0;
-    win.forEach((r) => (vc += (r - m) * (r - m)));
-    rollSd.push(Math.sqrt(vc / Math.max(1, win.length - 1)));
-  }
-  const lastSd = rollSd[Nd - 1];
-
   const dates = businessDays(new Date(2026, 5, 25), Nd);
 
   // Component-VaR shares (confidence-independent fractions), sorted desc.
@@ -159,13 +146,10 @@ export function computeRiskPayload(_portfolioId: string): RiskPayload {
   // Per-confidence headline metrics, cutoffs and historical series.
   const risk = {} as Record<Confidence, RiskBlock>;
   const cutoffs = {} as RiskPayload["pnlDistribution"]["cutoffs"];
-  const histVar1d = {} as Record<Confidence, number[]>;
-  const histVar20d = {} as Record<Confidence, number[]>;
 
   for (const conf of CONFIDENCES) {
     const tailP = conf === 99 ? 0.01 : 0.05;
     const deepP = conf === 99 ? 0.0025 : 0.01;
-    const z = conf === 99 ? 2.326 : 1.645;
 
     const tV = pnl[Math.floor(tailP * Nsim)]; // negative P&L at the tail quantile
     const deepV = pnl[Math.floor(deepP * Nsim)];
@@ -192,14 +176,6 @@ export function computeRiskPayload(_portfolioId: string): RiskPayload {
       })),
     };
     cutoffs[conf] = { var: tV, es: esVal, deep: deepV };
-
-    // Rolling historical VaR, scaled so the latest 1-day point equals the
-    // headline var1d fraction. (z cancels but is kept for clarity.)
-    const targetFrac = var1d / tot;
-    const scaleF = lastSd * z > 0 ? targetFrac / (lastSd * z) : 1;
-    const hv1d = rollSd.map((sd) => sd * z * scaleF * 100); // positive %
-    histVar1d[conf] = hv1d;
-    histVar20d[conf] = hv1d.map((v) => v * sq20);
   }
 
   const positions = [...holdings]
@@ -230,11 +206,6 @@ export function computeRiskPayload(_portfolioId: string): RiskPayload {
       maxPct: maxDD * 100,
       dates,
       series: ddFrac.map((d) => d * 100),
-    },
-    histVar: {
-      dates,
-      var1dPct: histVar1d,
-      var20dPct: histVar20d,
     },
     risk,
     pnlDistribution: {

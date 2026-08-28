@@ -44,7 +44,6 @@ pub struct RiskPayload {
     pub ann_vol_pct: f64,
     pub positions: Vec<PositionRow>,
     pub drawdown: Drawdown,
-    pub hist_var: HistVar,
     pub risk: ByConf<RiskBlock>,
     pub pnl_distribution: PnlDistribution,
     /// Phase 1 marker: the three chart series are synthetic until the engine
@@ -91,14 +90,6 @@ pub struct Drawdown {
     pub max_pct: f64,
     pub dates: Vec<String>,
     pub series: Vec<f64>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HistVar {
-    pub dates: Vec<String>,
-    pub var1d_pct: ByConf<Vec<f64>>,
-    pub var20d_pct: ByConf<Vec<f64>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,7 +253,6 @@ pub fn build(
         _ => None,
     };
     let drawdown = charts::drawdown(&equity, &dates);
-    let hist_var = charts::historical_var(&equity, &dates, total, var1d95, var1d99);
 
     Ok(RiskPayload {
         as_of: format!("{as_of}T16:00:00-04:00"),
@@ -274,7 +264,6 @@ pub fn build(
         ann_vol_pct,
         positions: rows,
         drawdown,
-        hist_var,
         risk,
         pnl_distribution,
         synthetic_charts: false,
