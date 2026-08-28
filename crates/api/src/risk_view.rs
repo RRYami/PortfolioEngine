@@ -149,7 +149,23 @@ pub fn build(
 ) -> Result<RiskPayload, ApiError> {
     let base = portfolio.base_currency;
     let cfg = MonteCarloConfig::default_var();
-    let report = compute_var(state, &pd.historical, &pd.fx, &pd.prices, &cfg, base, as_of)?;
+    // No options are modelled yet on this path: the API creates only equity
+    // instruments, so the kind map is empty and every position falls back to
+    // Equity. Wiring the real surfaces in is the next step, and doing it here
+    // is the only change this call site will need.
+    let kinds = std::collections::HashMap::new();
+    let surfaces = ptf_engine::StaticVolSurfaceProvider::new();
+    let report = compute_var(
+        state,
+        &pd.historical,
+        &pd.fx,
+        &pd.prices,
+        &kinds,
+        &surfaces,
+        &cfg,
+        base,
+        as_of,
+    )?;
 
     let total = f(state.total_value(&pd.fx, &pd.prices, base, as_of)?.amount);
 

@@ -24,6 +24,7 @@ pub mod price;
 pub mod repository;
 pub mod risk;
 pub mod svi;
+pub mod surface;
 pub mod transaction;
 pub mod user;
 pub mod valuation;
@@ -58,6 +59,7 @@ pub use repository::{
 };
 pub use risk::{AssetRisk, MonteCarloConfig, RiskError, VaREntry, VaRReport, compute_var};
 pub use svi::{Svi, SviError, SviFit, SlicePoint, calibrate};
+pub use surface::{StaticVolSurfaceProvider, SurfaceSnapshot, VolSurfaceProvider};
 pub use transaction::{CorporateAction, Transaction, TransactionKind};
 pub use user::User;
 pub use valuation::ValuationError;

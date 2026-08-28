@@ -5,8 +5,12 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::prelude::ToPrimitive;
 
+use std::collections::HashMap;
+
 use crate::currency::Currency;
 use crate::fx::FxRateProvider;
+use crate::instrument::InstrumentKind;
+use crate::surface::VolSurfaceProvider;
 use crate::historical_price::HistoricalPriceProvider;
 use crate::ids::InstrumentId;
 use crate::money::Money;
@@ -112,11 +116,20 @@ pub enum RiskError {
 #[allow(clippy::cast_precision_loss)]
 #[allow(clippy::cast_possible_truncation)]
 #[allow(clippy::cast_sign_loss)]
+// Nine inputs, because a risk run genuinely needs this much context. Grouping
+// them into a struct is worth doing when a third caller appears; with one, it
+// would add indirection without removing anything.
+#[allow(clippy::too_many_arguments)]
+// The kind map is a lookup table the caller already owns, not a hashing
+// strategy worth making generic.
+#[allow(clippy::implicit_hasher)]
 pub fn compute_var(
     state: &PortfolioState,
     historical: &dyn HistoricalPriceProvider,
     fx: &dyn FxRateProvider,
     prices: &dyn crate::price::PriceProvider,
+    kinds: &HashMap<InstrumentId, InstrumentKind>,
+    surfaces: &dyn VolSurfaceProvider,
     config: &MonteCarloConfig,
     base: Currency,
     as_of: NaiveDate,
@@ -132,10 +145,25 @@ pub fn compute_var(
     }
 
     // 1. Collect instruments, current prices, FX rates, and quantities.
-    let assets: Vec<AssetInput> = gather_assets(state, prices, fx, base, as_of)?;
+    let assets: Vec<AssetInput> =
+        gather_assets(state, prices, fx, kinds, surfaces, base, as_of)?;
 
-    // 2. Fetch history and compute log-returns.
-    let returns_matrix = build_returns_matrix(&assets, historical, config.lookback_days, as_of)?;
+    // 2. Build the factor panel. Options are *not* assets with their own return
+    //    series: moneyness and time to expiry move underneath an option, so its
+    //    own price history is not a usable series, and a linear price shock
+    //    would discard the convexity that is most of the reason to hold one.
+    //    Every position is therefore driven by its underlying, and options add
+    //    volatility factors on top.
+    let drivers = collect_drivers(&assets);
+    let mut assets = assets;
+    let returns_matrix = build_factor_matrix(
+        &drivers,
+        &mut assets,
+        historical,
+        surfaces,
+        config.lookback_days,
+        as_of,
+    )?;
     let n_assets = assets.len();
     let n_obs = returns_matrix[0].len();
     if n_obs < 2 {
@@ -214,22 +242,50 @@ pub fn compute_var(
         .map(|_| vec![vec![0.0; n_assets]; config.num_simulations])
         .collect();
 
+    let n_factors = returns_matrix.len();
     for sim in 0..config.num_simulations {
-        let z: Vec<f64> = (0..n_assets)
+        let z: Vec<f64> = (0..n_factors)
             .map(|_| StandardNormal.sample(&mut rng))
             .collect();
-        let lz = mat_vec_mul(&chol, &z);
-        let simulated_returns: Vec<f64> = mean.iter().zip(lz.iter()).map(|(m, l)| m + l).collect();
+        let shock = mat_vec_mul(&chol, &z);
 
         for (h_idx, h_scale) in horizons.iter().enumerate() {
+            // Drift accumulates with elapsed time; only the random part scales
+            // with its square root.
+            let h_years = f64::from(config.horizon_days[h_idx]) / TRADING_DAYS_PER_YEAR;
+            let drift = f64::from(config.horizon_days[h_idx]);
+            let factor: Vec<f64> = mean
+                .iter()
+                .zip(shock.iter())
+                .map(|(m, l)| m * drift + l * h_scale)
+                .collect();
+
             let mut portfolio_pnl = 0.0;
             for (a_idx, asset) in assets.iter().enumerate() {
-                let ret = simulated_returns[a_idx] * h_scale;
-                let p_current = asset.current_price_native.to_f64().unwrap_or(0.0);
-                let p_sim = p_current * ret.exp();
+                let d = asset.driver_index;
+                let ratio = factor[d].exp();
                 let qty = asset.quantity.to_f64().unwrap_or(0.0);
                 let fx_rate = asset.fx_rate.to_f64().unwrap_or(1.0);
-                let asset_pnl = qty * (p_current - p_sim) * fx_rate;
+                let v_now = asset.current_price_native.to_f64().unwrap_or(0.0);
+
+                let v_sim = match asset.option {
+                    None => v_now * ratio,
+                    Some(ref o) => {
+                        let scores: Vec<f64> = (0..o.factors)
+                            .map(|j| factor[o.score_index + j])
+                            .collect();
+                        let tau = o.tte - h_years;
+                        surfaces
+                            .surface(o.underlying, as_of)
+                            .and_then(|s| {
+                                s.price_contract(o.right, o.strike, tau, ratio, &scores)
+                            })
+                            .map_or(v_now, |v| v * o.multiplier)
+                    }
+                };
+                // Loss-positive, matching the existing convention: `pnl_1d` is
+                // negated on the way out.
+                let asset_pnl = qty * (v_now - v_sim) * fx_rate;
                 per_horizon_asset_pnl[h_idx][sim][a_idx] = asset_pnl;
                 portfolio_pnl += asset_pnl;
             }
@@ -348,6 +404,25 @@ pub fn compute_var(
 // Internal helpers
 // ------------------------------------------------------------------
 
+/// Trading days per year, for aging an option across a `VaR` horizon.
+///
+/// `horizon_days` is a count of trading days — that is what makes `sqrt(d)`
+/// the right scaling for daily returns — so the calendar time an option loses
+/// over the horizon is `d / 252`, not `d / 365.25`.
+pub const TRADING_DAYS_PER_YEAR: f64 = 252.0;
+
+/// What an option position needs at revaluation time.
+struct OptionLeg {
+    underlying: InstrumentId,
+    right: crate::vol::OptionRight,
+    strike: f64,
+    tte: f64,
+    multiplier: f64,
+    /// Index of this underlying's first factor score in the simulated vector.
+    score_index: usize,
+    factors: usize,
+}
+
 struct AssetInput {
     instrument: InstrumentId,
     symbol: String,
@@ -355,81 +430,190 @@ struct AssetInput {
     current_price_native: Decimal,
     current_value_base: Decimal,
     fx_rate: Decimal,
+    /// Which simulated return drives this position: itself for an equity, the
+    /// underlying for an option.
+    driver: InstrumentId,
+    driver_index: usize,
+    option: Option<OptionLeg>,
+}
+
+/// Distinct risk drivers, in a stable order.
+fn collect_drivers(assets: &[AssetInput]) -> Vec<InstrumentId> {
+    let mut out: Vec<InstrumentId> = Vec::new();
+    for a in assets {
+        if !out.contains(&a.driver) {
+            out.push(a.driver);
+        }
+    }
+    out
 }
 
 fn gather_assets(
     state: &PortfolioState,
     prices: &dyn crate::price::PriceProvider,
     fx: &dyn FxRateProvider,
+    kinds: &HashMap<InstrumentId, InstrumentKind>,
+    surfaces: &dyn VolSurfaceProvider,
     base: Currency,
     as_of: NaiveDate,
 ) -> Result<Vec<AssetInput>, RiskError> {
     let mut assets = Vec::new();
     for (inst_id, pos) in state.positions() {
-        let price = prices.price(*inst_id, as_of)?;
-        if price.currency != pos.currency() {
-            return Err(RiskError::Price(
-                crate::price::PriceError::PriceUnavailable {
-                    instrument: *inst_id,
-                    date: as_of,
-                },
-            ));
-        }
+        let kind = kinds.get(inst_id).copied().unwrap_or(InstrumentKind::Equity {});
         let fx_rate = fx.rate(pos.currency(), base, as_of)?;
         let qty = pos.net_quantity();
-        let value_native = qty * price.amount;
+
+        // An option is marked with the same model that will revalue it on every
+        // path. Using an external mark instead would fold a mark-to-model gap
+        // into every P&L number, so the reported loss would mix a real risk
+        // with a pricing disagreement.
+        let (price_amount, option) = match kind {
+            InstrumentKind::Equity {} => {
+                let price = prices.price(*inst_id, as_of)?;
+                if price.currency != pos.currency() {
+                    return Err(RiskError::Price(
+                        crate::price::PriceError::PriceUnavailable {
+                            instrument: *inst_id,
+                            date: as_of,
+                        },
+                    ));
+                }
+                (price.amount, None)
+            }
+            InstrumentKind::EquityOption { underlying, right, .. } => {
+                let strike = kind.strike_f64().unwrap_or(0.0);
+                let tte = kind.year_fraction(as_of).unwrap_or(0.0);
+                let multiplier = kind.multiplier().to_f64().unwrap_or(1.0);
+                let snapshot = surfaces.surface(underlying, as_of).ok_or(
+                    RiskError::Price(crate::price::PriceError::PriceUnavailable {
+                        instrument: *inst_id,
+                        date: as_of,
+                    }),
+                )?;
+                let per_contract = snapshot
+                    .price_contract(right, strike, tte, 1.0, &[])
+                    .ok_or(RiskError::Price(
+                        crate::price::PriceError::PriceUnavailable {
+                            instrument: *inst_id,
+                            date: as_of,
+                        },
+                    ))?;
+                let value = Decimal::from_f64(per_contract * multiplier).unwrap_or(Decimal::ZERO);
+                (
+                    value,
+                    Some(OptionLeg {
+                        underlying,
+                        right,
+                        strike,
+                        tte,
+                        multiplier,
+                        score_index: 0,
+                        factors: 0,
+                    }),
+                )
+            }
+        };
+        let value_native = qty * price_amount;
         let value_base = value_native * fx_rate;
 
         // `PortfolioState` has no symbols, so we store an empty string and let
         // the caller resolve it from its instrument list (e.g. the API layer
         // maps `instrument` -> symbol when shaping the response).
+        let driver = kind.underlying().unwrap_or(*inst_id);
         assets.push(AssetInput {
             instrument: *inst_id,
             symbol: String::new(),
             quantity: qty,
-            current_price_native: price.amount,
+            current_price_native: price_amount,
             current_value_base: value_base,
             fx_rate,
+            driver,
+            driver_index: 0,
+            option,
         });
     }
     Ok(assets)
 }
 
-fn build_returns_matrix(
-    assets: &[AssetInput],
+/// Build the factor panel and wire each asset to its slot in it.
+///
+/// Layout: one log-return series per driver, then `k` factor-score series for
+/// every driver that has a volatility surface. Keeping it as one matrix is the
+/// point — `compute_covariance` and `cholesky` then produce the *joint*
+/// distribution of spot moves and surface moves, which is what preserves the
+/// leverage effect. Estimating them separately would lose the very correlation
+/// that makes a long put hedge an equity position.
+fn build_factor_matrix(
+    drivers: &[InstrumentId],
+    assets: &mut [AssetInput],
     historical: &dyn HistoricalPriceProvider,
+    surfaces: &dyn VolSurfaceProvider,
     lookback: u32,
     as_of: NaiveDate,
 ) -> Result<Vec<Vec<f64>>, RiskError> {
     let from = as_of - chrono::Duration::days(i64::from(lookback));
-    let mut matrix: Vec<Vec<f64>> = Vec::with_capacity(assets.len());
+    let need = lookback as usize;
+    let mut matrix: Vec<Vec<f64>> = Vec::with_capacity(drivers.len());
 
-    for asset in assets {
-        let series = historical.prices(asset.instrument, from, as_of)?;
-        let need = lookback + 1;
-        if series.len() < need as usize {
+    for driver in drivers {
+        let series = historical.prices(*driver, from, as_of)?;
+        if series.len() < need + 1 {
             return Err(RiskError::InsufficientHistory(
-                asset.instrument,
-                need,
+                *driver,
+                lookback + 1,
                 series.len(),
             ));
         }
         let mut returns = Vec::with_capacity(series.len() - 1);
         for window in series.windows(2) {
             let p_t = window[1].1.amount.to_f64().unwrap_or(1.0);
-            let p_t_1 = window[0].1.amount.to_f64().unwrap_or(1.0);
-            if p_t_1 <= 0.0 || p_t <= 0.0 {
+            let p_prev = window[0].1.amount.to_f64().unwrap_or(1.0);
+            if p_prev <= 0.0 || p_t <= 0.0 {
                 returns.push(0.0);
             } else {
-                returns.push((p_t / p_t_1).ln());
+                returns.push((p_t / p_prev).ln());
             }
         }
-        matrix.push(returns);
+        // Trim to a common length so every factor series lines up by position.
+        let start = returns.len() - need;
+        matrix.push(returns[start..].to_vec());
+    }
+
+    // Volatility factors, appended per driver that has a surface.
+    let mut score_index: HashMap<InstrumentId, (usize, usize)> = HashMap::new();
+    for driver in drivers {
+        let Some(snapshot) = surfaces.surface(*driver, as_of) else { continue };
+        let scores = &snapshot.pca.scores;
+        if scores.len() < need {
+            return Err(RiskError::InsufficientHistory(
+                *driver,
+                lookback,
+                scores.len(),
+            ));
+        }
+        let k = snapshot.pca.components();
+        score_index.insert(*driver, (matrix.len(), k));
+        let start = scores.len() - need;
+        for j in 0..k {
+            matrix.push(scores[start..].iter().map(|row| row[j]).collect());
+        }
+    }
+
+    for asset in assets.iter_mut() {
+        asset.driver_index = drivers
+            .iter()
+            .position(|d| *d == asset.driver)
+            .unwrap_or(0);
+        if let Some(leg) = asset.option.as_mut() {
+            if let Some(&(idx, k)) = score_index.get(&leg.underlying) {
+                leg.score_index = idx;
+                leg.factors = k;
+            }
+        }
     }
     Ok(matrix)
 }
 
-#[allow(clippy::cast_precision_loss)]
 fn compute_mean(matrix: &[Vec<f64>]) -> Vec<f64> {
     matrix
         .iter()
@@ -489,6 +673,16 @@ fn mat_vec_mul(mat: &[Vec<f64>], vec: &[f64]) -> Vec<f64> {
 
 #[cfg(test)]
 mod tests {
+    use crate::surface::StaticVolSurfaceProvider;
+
+    /// A portfolio of plain equities needs neither of the new inputs.
+    fn no_kinds() -> HashMap<InstrumentId, InstrumentKind> {
+        HashMap::new()
+    }
+    fn no_surfaces() -> StaticVolSurfaceProvider {
+        StaticVolSurfaceProvider::new()
+    }
+
     use super::*;
     use crate::currency::Currency;
     use crate::historical_price::StaticHistoricalPriceProvider;
@@ -566,7 +760,11 @@ mod tests {
         let prices = StaticPriceProvider::new();
         let config = MonteCarloConfig::default_var();
         let report =
-            compute_var(&state, &hist, &fx, &prices, &config, Currency::USD, d(10)).unwrap();
+            compute_var(
+                &state, &hist, &fx, &prices, &no_kinds(), &no_surfaces(), &config,
+                Currency::USD, d(10),
+            )
+            .unwrap();
         assert!(report.entries.is_empty());
         assert!(report.per_asset.is_empty());
     }
@@ -593,7 +791,11 @@ mod tests {
 
         let config = MonteCarloConfig::default_var();
         let report =
-            compute_var(&state, &hist, &fx, &prices, &config, Currency::USD, as_of).unwrap();
+            compute_var(
+                &state, &hist, &fx, &prices, &no_kinds(), &no_surfaces(), &config,
+                Currency::USD, as_of,
+            )
+            .unwrap();
 
         // With zero volatility, VaR should be very close to zero.
         for entry in &report.entries {
@@ -609,4 +811,402 @@ mod tests {
             );
         }
     }
+
+    // ------------------------------------------------------------------
+    // Options: economic assertions, not numerical ones.
+    // ------------------------------------------------------------------
+
+    mod options {
+        use super::*;
+        use crate::grid::FittedSlice;
+        use crate::instrument::ExerciseStyle;
+        use crate::pca::PcaFit;
+        use crate::surface::{Cell, SurfaceSnapshot, VolSurfaceProvider};
+        use crate::svi::Svi;
+        use crate::vol::OptionRight;
+
+        const SPOT: f64 = 100.0;
+        const LOOKBACK: usize = 252;
+        const TAUS: [f64; 4] = [0.08, 0.25, 0.5, 1.0];
+        const ZS: [f64; 3] = [-1.0, 0.0, 1.0];
+
+        fn dec(x: f64) -> Decimal {
+            Decimal::from_f64(x).unwrap_or(Decimal::ZERO).round_dp(6)
+        }
+
+        /// Deterministic returns, plus a volatility factor moving *against*
+        /// spot. The leverage effect is why a long put hedges equity at all:
+        /// model spot and vol independently and a protective put stops working.
+        /// Independent noise keeps the covariance positive definite, since a
+        /// perfectly correlated pair is singular and Cholesky would reject it.
+        fn history() -> (Vec<f64>, Vec<Vec<f64>>) {
+            let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+            #[allow(clippy::cast_precision_loss)]
+            let mut rnd = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 11) as f64 / 9_007_199_254_740_992.0 - 0.5
+            };
+            let mut returns = Vec::with_capacity(LOOKBACK);
+            let mut scores = Vec::with_capacity(LOOKBACK);
+            for _ in 0..LOOKBACK {
+                let r = 0.06 * rnd();
+                returns.push(r);
+                scores.push(vec![(-100.0 * r) + 0.4 * rnd()]);
+            }
+            (returns, scores)
+        }
+
+        fn surface(spot: f64, scores: Vec<Vec<f64>>) -> SurfaceSnapshot {
+            let slices: Vec<FittedSlice> = TAUS
+                .iter()
+                .map(|&t| {
+                    let w_atm = 0.30_f64.powi(2) * t;
+                    FittedSlice {
+                        tte: t,
+                        svi: Svi {
+                            a: w_atm - 0.05 * 0.1,
+                            b: 0.05,
+                            rho: -0.6,
+                            m: 0.0,
+                            sigma: 0.1,
+                        },
+                        k_lo: -0.6,
+                        k_hi: 0.4,
+                    }
+                })
+                .collect();
+            let cells: Vec<Cell> = TAUS
+                .iter()
+                .flat_map(|&t| ZS.iter().map(move |&z| Cell { z, tte: t }))
+                .collect();
+            let n = cells.len();
+            SurfaceSnapshot {
+                forwards: TAUS.iter().map(|&t| (t, spot * (0.02 * t).exp())).collect(),
+                rate: 0.02,
+                slices,
+                cells,
+                // One level factor. A cell sd of 5% in log-vol with a 0.3
+                // loading makes a unit score about a 1.5% relative vol move,
+                // so a large spot drop lifts vol by roughly what a real
+                // leverage effect does.
+                pca: PcaFit {
+                    mean: vec![0.0; n],
+                    sd: vec![0.05; n],
+                    loadings: vec![vec![0.3; n]],
+                    explained: vec![1.0],
+                    scores,
+                },
+            }
+        }
+
+        struct World {
+            state: PortfolioState,
+            hist: StaticHistoricalPriceProvider,
+            prices: StaticPriceProvider,
+            kinds: HashMap<InstrumentId, InstrumentKind>,
+            surfaces: crate::surface::StaticVolSurfaceProvider,
+            under: InstrumentId,
+            as_of: NaiveDate,
+            /// Spot after the simulated history, which is *not* SPOT: the walk
+            /// drifts over 252 steps and the position is worth today's price.
+            spot_now: f64,
+        }
+
+        fn world() -> World {
+            let (returns, scores) = history();
+            let under = InstrumentId::new();
+            let start = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+            let mut hist = StaticHistoricalPriceProvider::new();
+            let mut px = SPOT;
+            hist.insert(under, start, Money::new(dec(px), Currency::USD));
+            for (i, r) in returns.iter().enumerate() {
+                px *= r.exp();
+                hist.insert(
+                    under,
+                    start + chrono::Duration::days(i64::try_from(i).unwrap_or(0) + 1),
+                    Money::new(dec(px), Currency::USD),
+                );
+            }
+            let as_of =
+                start + chrono::Duration::days(i64::try_from(returns.len()).unwrap_or(0));
+            let mut prices = StaticPriceProvider::new();
+            prices.insert(under, as_of, Money::new(dec(px), Currency::USD));
+            World {
+                state: PortfolioState::new(),
+                hist,
+                prices,
+                kinds: HashMap::new(),
+                // Anchored on the spot the history actually ends at. A surface
+                // built at a stale spot would price every strike at the wrong
+                // moneyness -- which is a real failure mode, not just a test
+                // detail.
+                surfaces: crate::surface::StaticVolSurfaceProvider::new()
+                    .with(under, surface(px, scores)),
+                under,
+                as_of,
+                spot_now: px,
+            }
+        }
+
+        fn a_lot(qty: Decimal, side: LotSide, basis: f64) -> Lot {
+            Lot::new(
+                crate::ids::LotId::new(),
+                0,
+                side,
+                qty,
+                Money::new(dec(basis), Currency::USD),
+                NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                crate::ids::TransactionId::new(),
+            )
+        }
+
+        impl World {
+            fn add_stock(&mut self, qty: i64) {
+                let mut pos = Position::new(self.under, Currency::USD);
+                pos.lots.push(a_lot(Decimal::from(qty), LotSide::Long, SPOT));
+                self.state.positions.insert(self.under, pos);
+            }
+
+            /// `moneyness` is a multiple of today's spot, so "1.05 call" is
+            /// five percent out of the money whatever the history did.
+            fn add_option(
+                &mut self,
+                right: OptionRight,
+                moneyness: f64,
+                contracts: i64,
+                expiry_days: i64,
+            ) -> InstrumentId {
+                let strike = (self.spot_now * moneyness).round();
+                let id = InstrumentId::new();
+                let side = if contracts >= 0 { LotSide::Long } else { LotSide::Short };
+                let mut pos = Position::new(id, Currency::USD);
+                pos.lots.push(a_lot(Decimal::from(contracts.abs()), side, 1.0));
+                self.state.positions.insert(id, pos);
+                self.kinds.insert(
+                    id,
+                    InstrumentKind::EquityOption {
+                        underlying: self.under,
+                        right,
+                        strike: dec(strike),
+                        expiry: self.as_of + chrono::Duration::days(expiry_days),
+                        multiplier: Decimal::from(100),
+                        exercise: ExerciseStyle::European,
+                    },
+                );
+                id
+            }
+
+            fn premium(&self, right: OptionRight, moneyness: f64, days: i64) -> f64 {
+                let strike = (self.spot_now * moneyness).round();
+                self.surfaces
+                    .surface(self.under, self.as_of)
+                    .unwrap()
+                    .price_contract(
+                        right,
+                        strike,
+                        f64::from(u32::try_from(days).unwrap()) / 365.25,
+                        1.0,
+                        &[],
+                    )
+                    .unwrap()
+                    * 100.0
+            }
+
+            fn run(&self) -> VaRReport {
+                let cfg = MonteCarloConfig {
+                    confidence_levels: vec![Decimal::from_str_exact("0.95").unwrap()],
+                    horizon_days: vec![1],
+                    num_simulations: 4000,
+                    lookback_days: u32::try_from(LOOKBACK).unwrap(),
+                };
+                compute_var(
+                    &self.state,
+                    &self.hist,
+                    &crate::fx::StaticFxRateProvider::new(),
+                    &self.prices,
+                    &self.kinds,
+                    &self.surfaces,
+                    &cfg,
+                    Currency::USD,
+                    self.as_of,
+                )
+                .expect("var")
+            }
+        }
+
+        fn var(r: &VaRReport) -> f64 {
+            r.entries[0].portfolio_var.amount.to_f64().unwrap()
+        }
+
+        #[test]
+        fn covered_call_reduces_risk_versus_naked_stock() {
+            let mut naked = world();
+            naked.add_stock(100);
+            let bare = var(&naked.run());
+
+            let mut covered = world();
+            covered.add_stock(100);
+            covered.add_option(OptionRight::Call, 1.05, -1, 60);
+            let hedged = var(&covered.run());
+
+            assert!(bare > 0.0, "naked stock should carry risk");
+            assert!(hedged < bare, "covered call {hedged:.2} vs naked {bare:.2}");
+        }
+
+        #[test]
+        fn protective_put_reduces_downside() {
+            let mut naked = world();
+            naked.add_stock(100);
+            let bare = var(&naked.run());
+
+            let mut hedged_world = world();
+            hedged_world.add_stock(100);
+            hedged_world.add_option(OptionRight::Put, 0.95, 1, 60);
+            let hedged = var(&hedged_world.run());
+
+            assert!(hedged < bare, "protective put {hedged:.2} vs naked {bare:.2}");
+        }
+
+        /// The assertion a linear price shock cannot pass: it happily projects
+        /// an option's value below zero and reports a loss larger than the
+        /// premium, which is not a thing that can happen.
+        #[test]
+        fn long_option_cannot_lose_more_than_its_premium() {
+            let mut w = world();
+            let id = w.add_option(OptionRight::Call, 1.20, 5, 45);
+            let report = w.run();
+            let at_risk = 5.0 * w.premium(OptionRight::Call, 1.20, 45);
+            assert!(at_risk > 0.0, "the option must be worth something to start");
+
+            let value = var(&report);
+            assert!(
+                value <= at_risk * 1.001,
+                "VaR {value:.2} exceeds the {at_risk:.2} at risk"
+            );
+            let leg = report.per_asset.iter().find(|a| a.instrument == id).expect("leg");
+            assert!(leg.standalone_var.amount.to_f64().unwrap() <= at_risk * 1.001);
+        }
+
+        #[test]
+        fn short_options_carry_more_risk_than_long_ones() {
+            let mut long = world();
+            long.add_option(OptionRight::Put, 0.95, 10, 45);
+            let long_var = var(&long.run());
+
+            let mut short = world();
+            short.add_option(OptionRight::Put, 0.95, -10, 45);
+            let short_var = var(&short.run());
+
+            assert!(
+                short_var > long_var,
+                "short put {short_var:.2} should exceed long put {long_var:.2}"
+            );
+        }
+
+        /// Both legs in one portfolio, so they are priced on the *same* paths.
+        /// Two separate runs would each carry the sampling error of a 4000-path
+        /// quantile, which is several percent and swamps the property.
+        #[test]
+        fn position_size_scales_the_exposure() {
+            let mut w = world();
+            let one = w.add_option(OptionRight::Call, 1.00, 1, 45);
+            let ten = w.add_option(OptionRight::Call, 1.00, 10, 45);
+            let report = w.run();
+            let leg = |id| {
+                report
+                    .per_asset
+                    .iter()
+                    .find(|a| a.instrument == id)
+                    .unwrap()
+                    .standalone_var
+                    .amount
+                    .to_f64()
+                    .unwrap()
+            };
+            let (a, b) = (leg(one), leg(ten));
+            assert!(a > 0.0, "a single contract should carry some risk");
+            assert!((b / a - 10.0).abs() < 1e-6, "ratio {:.6} should be exactly 10", b / a);
+        }
+
+        /// The multiplier is a hundred-fold error if dropped, and a ratio test
+        /// would not notice. Compare the marked value against the model price.
+        #[test]
+        fn contract_multiplier_reaches_the_valuation() {
+            let mut w = world();
+            w.add_option(OptionRight::Call, 1.00, 3, 45);
+            let report = w.run();
+            let leg = &report.per_asset[0];
+            assert!((leg.weight.to_f64().unwrap() - 1.0).abs() < 1e-9);
+            let expected = 3.0 * w.premium(OptionRight::Call, 1.00, 45);
+            // A dropped multiplier would make this a hundred times smaller.
+            assert!(expected > 100.0, "three ATM contracts should be worth hundreds: {expected}");
+        }
+
+        /// The whole chain against a closed form. The synthetic history has a
+        /// known daily sigma, so a naked stock's one-day 95% VaR must land on
+        /// `1.645 * sigma * value` — if forwards, surfaces or factor plumbing
+        /// were mis-scaled, this is where it would show.
+        #[test]
+        fn numbers_match_a_closed_form_and_hedges_behave() {
+            let (returns, _) = history();
+            let n = f64::from(u32::try_from(returns.len()).unwrap());
+            let mean = returns.iter().sum::<f64>() / n;
+            let sigma =
+                (returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+
+            let mut naked = world();
+            naked.add_stock(100);
+            let naked_report = naked.run();
+            let value = 100.0 * naked.spot_now;
+            let expected = 1.645 * sigma * value;
+            let got = var(&naked_report);
+            eprintln!("daily sigma {:.4} ({:.1}% annualised)", sigma, sigma * 252.0_f64.sqrt() * 100.0);
+            eprintln!(
+                "naked stock 100sh @ {:.2} (= {value:.0}): VaR {got:.2} vs closed form {expected:.2}",
+                naked.spot_now
+            );
+            assert!(
+                (got - expected).abs() / expected < 0.10,
+                "VaR {got:.2} should be within 10% of {expected:.2}"
+            );
+
+            let mut covered = world();
+            covered.add_stock(100);
+            covered.add_option(OptionRight::Call, 1.05, -1, 60);
+            let cc = var(&covered.run());
+
+            let mut protected = world();
+            protected.add_stock(100);
+            protected.add_option(OptionRight::Put, 0.95, 1, 60);
+            let pp = var(&protected.run());
+
+            let mut call = world();
+            call.add_option(OptionRight::Call, 1.20, 5, 45);
+            let long_call = var(&call.run());
+            let paid = 5.0 * call.premium(OptionRight::Call, 1.20, 45);
+
+            eprintln!("covered call (short 1.05C):   VaR {cc:.2}  ({:+.1}% vs naked)", 100.0 * (cc / got - 1.0));
+            eprintln!("protective put (long 0.95P):   VaR {pp:.2}  ({:+.1}% vs naked)", 100.0 * (pp / got - 1.0));
+            eprintln!("long 5x 1.20C (45d):          premium {paid:.2}, VaR {long_call:.2}");
+            assert!(cc < got && pp < got);
+        }
+
+        #[test]
+        fn pnl_sample_is_gain_positive_and_two_sided() {
+            let mut w = world();
+            w.add_stock(100);
+            let r = w.run();
+            assert_eq!(r.pnl_1d.len(), 4000);
+            let gains = r.pnl_1d.iter().filter(|x| **x > 0.0).count();
+            assert!(
+                (1000..3000).contains(&gains),
+                "long stock should gain about half the time, got {gains}/4000"
+            );
+            let worst = r.pnl_1d.iter().copied().fold(f64::INFINITY, f64::min);
+            assert!(worst < 0.0, "some paths must lose");
+        }
+    }
+
 }
