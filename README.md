@@ -42,12 +42,71 @@ For frontend development with hot reload, run the backend in Docker
 - **Corporate actions**: splits and reverse-splits scale lot quantities and basis, preserving total cost basis.
 - **Property-based tests**: 16 proptest invariants guard fold, FX, and valuation against regressions.
 - **Risk analytics (VaR/CVaR)**: Monte-Carlo `compute_var()` with Cholesky decomposition, configurable confidence levels and horizons, and per-asset component-VaR decomposition.
+- **Listed options**: contracts are held as first-class instruments and revalued through a fitted volatility surface on every simulated path, rather than shocked linearly like a stock. See [Options and the volatility surface](#options-and-the-volatility-surface).
 - **Historical price provider**: `HistoricalPriceProvider` trait for lookback windows; `StaticHistoricalPriceProvider` for tests and demos.
 - **Web app**: an Axum analytics API (`crates/api/`) over the engine, a Python price service (yfinance → DuckDB → Parquet), and a Next.js dashboard — see [Run the full stack (Docker)](#run-the-full-stack-docker).
 
+## Options and the volatility surface
+
+An option cannot be risked like a stock. Its own price history is not a usable
+return series — moneyness and time to expiry move underneath it — and a linear
+price shock throws away the convexity that is most of the reason to hold one.
+It will happily project a long call's value below zero and report a loss larger
+than the premium.
+
+So options are driven by their **underlying**, and revalued through a
+volatility surface fitted offline. The pipeline runs in five stages, each
+writing a Parquet artifact the next one reads:
+
+| Stage | Produces | What it does |
+|---|---|---|
+| Ingest (`services/prices/ingest_databento.py`) | `options.parquet` | One 15:45 ET chain snapshot per session from Databento OPRA, with quote sizes and a staleness marker |
+| Forwards | `option_forwards.parquet` | Recovers `F` and `DF` per expiry by put-call parity — no external rate curve or dividend estimate |
+| Smiles | `vol_surface_params.parquet` | One SVI slice per expiry, so the smile can be read *between* listed strikes |
+| Grid | `vol_grid.parquet` | Resamples onto fixed standardised-moneyness and constant-maturity axes, so a cell means the same thing on consecutive days |
+| Factors | `vol_pca_loadings.parquet`, `vol_pca_scores.parquet` | Three principal components of daily log-vol changes: level, skew rotation, term-structure interaction |
+
+Stages 2-5 are one command:
+
+```bash
+cargo run --release -p ptf-surface        # reads options.parquet, writes the other five
+```
+
+At risk time the engine loads only the small artifacts it needs — forwards and
+factors, about 4,300 rows against the 469,000 quotes they were built from — and
+folds volatility factors into the *same* covariance matrix as spot returns.
+That joint estimation is what preserves the leverage effect: model spot and vol
+independently and a protective put stops hedging.
+
+Holding one:
+
+```bash
+curl -X POST localhost:8080/api/portfolios/$PID/options \
+  -H 'content-type: application/json' \
+  -d '{"underlying":"SOXX","right":"call","strike":"540","expiry":"2026-11-20",
+       "contracts":"2","premium":"28","currency":"USD"}'
+```
+
+The underlying is fetched from the price service on the way, since the risk run
+needs its history. Contracts are stored under their OCC symbol
+(`SOXX  261120C00540000`) — the same format the ingest writes — so a position
+in the book matches a row in the chain without a translation table.
+
+Writing options is refused rather than half-supported: opening a short needs a
+margin model this book does not have. An option whose underlying has no fitted
+surface is refused at the point of adding it, because accepting it would leave
+a book whose `/risk` call fails outright, and silently under-reporting risk is
+the worse failure.
+
+**Known limitation.** Put-call parity holds as an identity only for European
+exercise. SOXX, SPY and single names are American, so the extracted forward and
+inverted volatility carry a small early-exercise bias. The style is recorded on
+every contract; de-Americanising the prices is not yet done.
+
 ## Status
 
-**v1 fold and valuation complete. Analytics API + web dashboard implemented.**
+**v1 fold and valuation complete. Analytics API + web dashboard implemented.
+Listed options are modelled end to end, from chain ingest to risk.**
 
 Implemented:
 - Deposit, Withdrawal, Fee
@@ -66,13 +125,19 @@ Implemented:
 - **Repository traits**: async `PortfolioRepository`, `TransactionRepository`, `InstrumentRepository` with thread-safe in-memory implementations
 - **Users + authentication**: argon2id password hashing, server-side sessions (Postgres-backed, HttpOnly cookie), per-user portfolio ownership with 404-on-foreign isolation, login/register/logout endpoints, per-IP rate limiting on auth routes, and a login/register UI in the dashboard. Registration can be disabled with `PTF_DISABLE_REGISTRATION=1`.
 - **Postgres persistence crate** (`crates/persistence/`): `sqlx`-based `Pg*Repository` implementations of the four repository traits, embedded migrations, and connection pool helpers. `transactions` is a TimescaleDB hypertable partitioned by `trade_date`; portfolios, instruments, and users stay plain reference tables.
-- **Analytics API** (`crates/api/`): Axum HTTP service over the engine — create portfolios, add holdings, fetch a positions view (holdings valued at spot with their tax lots) and a risk payload (VaR/ES, component VaR, positions, and chart series) computed by `compute_var`
+- **Analytics API** (`crates/api/`): Axum HTTP service over the engine — create portfolios, add holdings and options, fetch a positions view (holdings valued at spot with their tax lots) and a risk payload (VaR/ES, component VaR, positions, and chart series) computed by `compute_var`
+- **Option pricing kernel** (`vol.rs`): Black-76 on the forward, greeks, and an implied-vol inversion that reports its own conditioning — a premium that is nearly all intrinsic cannot pin a volatility down, so the solver refuses rather than returning whichever member of the admissible band it landed on
+- **Volatility surface pipeline** (`crates/surface/`): parity forwards, SVI smiles, a constant-maturity grid, and a three-factor PCA of daily surface changes — see [Options and the volatility surface](#options-and-the-volatility-surface)
+- **Options in risk**: `InstrumentKind::EquityOption` carries the full contract terms; `compute_var` drives each option off its underlying and reprices it through the shocked surface on every path, so a long option's loss is bounded by its premium the way a real one is
 - **Price service + dashboard**: Python `services/prices/` (yfinance → DuckDB → Parquet) feeding the API, and a Next.js `frontend/` dashboard; the whole stack runs via Docker Compose
-- 210 unit tests (including 28 Postgres repository tests and 9 auth tests) + 16 property tests + 36 serde round-trip tests, all passing
+- 333 tests, all passing: 227 engine unit tests, 18 API tests, 28 Postgres repository tests, 22 property tests (fold, valuation, and the option kernel), 37 serde round-trip tests, and one that prices a real SOXX chain end to end
 
 Deferred:
 - Snapshot caching for performance
-- Borrow fees, margin interest, derivatives
+- Borrow fees, margin interest
+- Writing options (needs a margin model) and closing them other than through `/sell`
+- De-Americanising option prices before the parity fit
+- Backtesting the VaR model (Kupiec, Christoffersen) — needs a second year of option history for an out-of-sample window
 
 ## Quick start
 
@@ -87,6 +152,16 @@ DATABASE_URL=postgres://ptf:ptf@localhost:5433/ptf_engine cargo run -p ptf-api
 
 # Auth env flags: PTF_DISABLE_REGISTRATION=1 (close sign-up),
 # PTF_SECURE_COOKIES=1 (Secure cookie flag — enable behind TLS)
+# Options: PTF_SURFACES=<dir> where the surface artifacts live
+# (default services/prices/data)
+
+# Ingest option chains (costs money; --preview-cost prices a day first)
+export DATABENTO_API_KEY=...   # or: set -a; source .env.local; set +a
+uv run --extra options python services/prices/ingest_databento.py \
+  --root SOXX --start 2025-08-21 --end 2026-08-20 --max-cost 10
+
+# Build the surface artifacts from the ingested chains
+cargo run --release -p ptf-surface
 
 # Run all tests (domain only, no serde, no in-memory repo)
 cargo test --workspace
@@ -128,6 +203,12 @@ ptf_engine/
         historical_price.rs # HistoricalPriceProvider, StaticHistoricalPriceProvider
         price.rs           # PriceProvider, PriceError, StaticPriceProvider
         risk.rs            # MonteCarloConfig, VaRReport, AssetRisk, compute_var()
+        vol.rs             # Black-76 pricing, greeks, implied-vol inversion
+        forward.rs         # put-call parity forwards + a session-wide discount curve
+        svi.rs             # SVI smile parameterisation and calibration
+        grid.rs            # resampling smiles onto constant-maturity, standardised-moneyness cells
+        pca.rs             # one-sided Jacobi SVD, standardisation, factor reconstruction
+        surface.rs         # SurfaceSnapshot + VolSurfaceProvider — what the risk engine prices against
         valuation.rs       # ValuationError, PortfolioState::total_value()
         transaction.rs     # Transaction, TransactionKind, CorporateAction + constructors
         lot.rs             # Lot struct with sequence, side, basis
@@ -139,7 +220,7 @@ ptf_engine/
         currency.rs        # Currency newtype (3-letter ASCII uppercase)
         error.rs           # DomainError enum
         ids.rs             # Uuid newtypes (InstrumentId, LotId, etc.)
-        instrument.rs      # Instrument, InstrumentKind
+        instrument.rs      # Instrument, InstrumentKind (Equity, EquityOption), ExerciseStyle
         lot_method.rs      # LotMethod, LotSide, LotSelection, LotSelectionEntry
         repository/        # storage contracts and in-memory impls
           mod.rs           # re-exports
@@ -151,17 +232,28 @@ ptf_engine/
       tests/
         fold_properties.rs       # proptest invariants for fold (11 properties)
         valuation_properties.rs  # proptest invariants for FX and valuation (5 properties)
-        serde_roundtrip.rs       # serde round-trip tests (35 tests, serde feature)
+        vol_properties.rs        # proptest invariants for the option kernel (6 properties)
+        vol_real_chain.rs        # inverts 22 real SOXX quotes and checks the smile shape
+        serde_roundtrip.rs       # serde round-trip tests (37 tests, serde feature)
     api/                  # Axum HTTP API (ptf-api)
       Dockerfile
       src/
         main.rs            # server bootstrap + price-source selection (synthetic / parquet)
-        handlers.rs        # routes: portfolios, holdings, positions, risk
+        handlers.rs        # routes: portfolios, holdings, options, positions, risk
         auth.rs            # session auth: register/login/logout/me, axum-login backend
         risk_view.rs       # maps VaRReport + PortfolioState → dashboard JSON
         positions_view.rs  # lightweight positions + tax-lot view (no Monte-Carlo)
         charts.rs          # P&L distribution, drawdown, historical-VaR series
         price_source.rs    # SyntheticPriceSource + ParquetPriceSource (reads Parquet)
+        surface_source.rs  # loads the surface artifacts into a VolSurfaceProvider
+    surface/              # offline surface builder (ptf-surface)
+      src/
+        main.rs            # CLI: options.parquet -> forwards, smiles, grid, factors
+        quotes.rs          # reads the ingested chain
+        build.rs           # per-session forwards, IV cloud, SVI slices, grid sampling
+        factors.rs         # assembles the PCA panel and fits it per root
+        write.rs           # the four output artifacts (a published column contract)
+        error.rs           # SurfaceError
     persistence/          # Postgres persistence (ptf-persistence)
       Cargo.toml
       src/
@@ -177,6 +269,10 @@ ptf_engine/
         0002_users.sql     # users table + portfolios.user_id FK
   services/
     prices/               # Python price/FX service (yfinance → DuckDB → Parquet)
+      server.py            # FastAPI: /ensure fetches and caches prices + FX
+      options_db.py        # DuckDB store for option chains (separate file from prices)
+      ingest_databento.py  # concurrent OPRA chain snapshots -> DuckDB + Parquet
+      data/                # generated artifacts (gitignored)
   frontend/               # Next.js dashboard — Positions + Risk pages with a shared sidebar shell
 ```
 
@@ -194,7 +290,9 @@ The domain layer (`crates/engine/src/`) has **zero I/O dependencies** — no `sq
 - **Immutable transactions, derived state**: positions are never mutated directly. The fold is the canonical computation, making the system fully auditable and time-travel capable.
 - **Atomic apply**: every transaction is validated before any state mutation. A failed transaction leaves `PortfolioState` unchanged.
 - **Deterministic lot ordering**: `Lot::sequence` (a monotonic `u64` from `PortfolioState::next_lot_sequence`) guarantees that FIFO/LIFO selection is identical across runs, even when multiple lots share the same `open_date`.
-- **No `f64` for money**: all monetary amounts use `rust_decimal::Decimal`. No floating-point rounding errors.
+- **No `f64` for money, no `Decimal` for statistics**: monetary amounts and exact contract terms — strikes, multipliers — use `rust_decimal::Decimal`, so there are no floating-point rounding errors and `InstrumentKind` stays `Copy`, `Eq` and `Hash`. Volatility, covariance and factor scores are `f64`: they are measurements, the maths is transcendental, and a VaR run does millions of these. The conversion happens at the boundary, which is what `risk.rs` already did for covariance.
+- **One pricing kernel**: the same Black-76 implementation inverts a quote when the surface is fitted and prices a position when risk is run. Two implementations of one formula drift apart in the last decimals and disagree much further in the greeks, so the surface and the valuation are built from a single source.
+- **Refuse rather than guess**: `implied_vol` reports when a premium cannot determine a volatility (deep in- or out-of-the-money, where vega is negligible) instead of returning an arbitrary member of the admissible band; the grid omits a cell it would have to extrapolate a maturity for; a negative fitted rate is floored rather than propagated as a discount factor above one.
 - **Sync traits, async adapters**: `FxRateProvider` and `PriceProvider` are synchronous in the domain. Real-world async fetching happens at the adapter layer — batch-fetch rates into a `StaticFxRateProvider`, then pass it to `total_value()`.
 - **No silent substitution**: `total_value()` returns `ValuationError::PriceCurrencyMismatch` when a price's currency doesn't match the position's currency, `FxError::RateUnavailable` when a cross-currency rate is missing, and `PriceError::PriceUnavailable` when a price is missing. Zero and wrong-currency values are never substituted silently.
 
