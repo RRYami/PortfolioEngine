@@ -3,6 +3,7 @@
 //! Pure types and logic for portfolios, instruments, transactions,
 //! positions, lots, and multi-currency cash.
 
+pub mod backtest;
 pub mod currency;
 pub mod error;
 pub mod fold;
@@ -30,6 +31,7 @@ pub mod user;
 pub mod valuation;
 pub mod vol;
 
+pub use backtest::{BacktestError, BacktestReport, Outcome};
 pub use currency::Currency;
 pub use error::DomainError;
 pub use fold::fold;

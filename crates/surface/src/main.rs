@@ -12,6 +12,7 @@
 //!
 //! usage: `ptf-surface [<options.parquet>] [--out <dir>]`
 
+mod backtest;
 mod build;
 mod error;
 mod factors;
@@ -89,6 +90,11 @@ fn run() -> Result<(), error::SurfaceError> {
     write::grid(&grid_path, &grid)?;
 
     let fits = fit_factors(&grid);
+    // Backtest: only meaningful once there is history to hold out.
+    if std::env::args().any(|a| a == "--backtest") {
+        run_backtest(&svis, &forwards, &grid);
+    }
+
     let load_path = out.join("vol_pca_loadings.parquet");
     let score_path = out.join("vol_pca_scores.parquet");
     write::pca_loadings(&load_path, &fits)?;
@@ -126,6 +132,58 @@ fn run() -> Result<(), error::SurfaceError> {
         totals.no_forward
     );
     Ok(())
+}
+
+/// Score the risk model out of sample and print the verdict.
+///
+/// The book is 100 shares plus one roughly at-the-money three-month call, so
+/// the test exercises both legs the engine handles differently: a linear one
+/// and a convex one whose value depends on the surface.
+fn run_backtest(svis: &[build::SviRow], forwards: &[build::ForwardRow], grid: &[build::GridRow]) {
+    use std::collections::BTreeSet;
+    let roots: BTreeSet<&str> = svis.iter().map(|s| s.root.as_str()).collect();
+    for root in roots {
+        let s: Vec<build::SviRow> =
+            svis.iter().filter(|r| r.root == root).cloned().collect();
+        let f: Vec<build::ForwardRow> =
+            forwards.iter().filter(|r| r.root == root).cloned().collect();
+        let g: Vec<build::GridRow> =
+            grid.iter().filter(|r| r.root == root).cloned().collect();
+        let book = backtest::Book { shares: 100.0, calls: 1.0, option_tenor: 0.25 };
+        match backtest::run(&s, &f, &g, book, 0x5eed) {
+            Some((days, r95, r99)) => {
+                let mean_var = days.iter().map(|d| d.var95).sum::<f64>()
+                    / f64::from(u32::try_from(days.len()).unwrap_or(1));
+                let mean_value = days.iter().map(|d| d.value).sum::<f64>()
+                    / f64::from(u32::try_from(days.len()).unwrap_or(1));
+                eprintln!(
+                    "\nbacktest {root}: {} scored days, mean book {mean_value:.0}, \
+                     mean 95% VaR {mean_var:.0} ({:.2}% of value)",
+                    days.len(),
+                    100.0 * mean_var / mean_value
+                );
+                for r in [&r95, &r99] {
+                    eprintln!("  {r}");
+                    let t = r.transitions;
+                    eprintln!(
+                        "      transitions quiet->quiet {} quiet->hit {} hit->quiet {} hit->hit {}{}",
+                        t[0][0], t[0][1], t[1][0], t[1][1],
+                        if t[1][1] == 0 {
+                            "  (no back-to-back exceptions: independence is undetermined, not confirmed)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                let worst = days
+                    .iter()
+                    .map(|d| d.realised_loss / d.var95)
+                    .fold(0.0_f64, f64::max);
+                eprintln!("      worst breach: {worst:.2}x the 95% VaR");
+            }
+            None => eprintln!("\nbacktest {root}: not enough history"),
+        }
+    }
 }
 
 /// Fit the factor model per root, over the whole history rather than per
