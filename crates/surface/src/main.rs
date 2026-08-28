@@ -10,7 +10,10 @@
 //! engine crate stays free of I/O, which is why the maths lives there and the
 //! parquet plumbing lives here.
 //!
-//! usage: `ptf-surface [<options.parquet>] [--out <dir>]`
+//! usage: `ptf-surface [<options.parquet>] [--out <dir>] [--root <ROOT>]`
+//!
+//! Reads `market.option_quote` when `DATABASE_URL` is set; `--parquet` forces
+//! the file instead.
 
 mod backtest;
 mod build;
@@ -37,6 +40,31 @@ fn main() -> ExitCode {
     }
 }
 
+/// Postgres when `DATABASE_URL` is set, unless `--parquet` forces the file.
+///
+/// The database is the store the ingest writes to now; the file reader stays
+/// so an archived export can still be refitted without one.
+fn load_chain(args: &[String], input: &std::path::Path) -> Result<quotes::Chain, error::SurfaceError> {
+    let force_file = args.iter().any(|a| a == "--parquet");
+    match std::env::var("DATABASE_URL") {
+        Ok(dsn) if !force_file => {
+            let root = args
+                .iter()
+                .position(|a| a == "--root")
+                .and_then(|i| args.get(i + 1));
+            match root {
+                Some(r) => eprintln!("reading market.option_quote (root {r})"),
+                None => eprintln!("reading market.option_quote"),
+            }
+            quotes::load_postgres(&dsn, root.map(String::as_str))
+        }
+        _ => {
+            eprintln!("reading {}", input.display());
+            quotes::load(input)
+        }
+    }
+}
+
 fn run() -> Result<(), error::SurfaceError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let out = args
@@ -49,8 +77,7 @@ fn run() -> Result<(), error::SurfaceError> {
         .find(|a| !a.starts_with("--") && a.as_str() != out.to_string_lossy())
         .map_or_else(|| PathBuf::from(DEFAULT_IN), PathBuf::from);
 
-    eprintln!("reading {}", input.display());
-    let chain = quotes::load(&input)?;
+    let chain = load_chain(&args, &input)?;
     let quotes_in: usize =
         chain.values().flat_map(BTreeValues::values).map(|(_, q)| q.len()).sum();
     eprintln!("{} sessions, {quotes_in} quotes", chain.len());

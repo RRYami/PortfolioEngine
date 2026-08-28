@@ -20,6 +20,9 @@ import pandas as pd
 
 DATA = Path(os.environ.get("PRICES_DATA") or (Path(__file__).resolve().parent / "data"))
 DB_PATH = DATA / "options.duckdb"
+
+# Venue whose sessions define a trading day, matching market.trading_day.
+CALENDAR = "XNYS"
 OPTIONS_PARQUET = DATA / "options.parquet"
 RAW_DIR = DATA / "raw_quotes"
 
@@ -193,6 +196,76 @@ def write_partition(con, df: pd.DataFrame, date: dt.date, root: str) -> Path:
     finally:
         con.unregister("_partition")
     return path
+
+
+def sync_postgres(con, dsn: str | None = None) -> dict:
+    """Mirror the quote store and ingest log into Postgres.
+
+    `ptf-surface` reads `market.option_quote` when DATABASE_URL is set, so a
+    backfill that only reached DuckDB would leave the fitted surface stale.
+
+    Best-effort, like the price sync: a Databento session that was paid for and
+    stored should not be reported as failed because the database is down. DuckDB
+    stays the record and pg_backfill.py reconciles.
+
+    Only the log is allowed non-trading days -- recording that a session was a
+    holiday is its purpose. Quotes must fall on a session, and the calendar is
+    extended from the exchange rather than inferred from the data.
+    """
+    dsn = dsn or os.environ.get("DATABASE_URL")
+    if not dsn:
+        return {"synced": False, "reason": "DATABASE_URL unset"}
+    try:
+        import exchange_calendars as xc
+        import psycopg
+    except ImportError as e:  # pragma: no cover
+        return {"synced": False, "reason": f"missing dependency: {e.name}"}
+
+    cols = ", ".join(COLUMNS)
+    quotes = con.execute(
+        f"SELECT {cols} FROM option_quotes "
+        "ORDER BY quote_date, root, expiry, opt_right, strike"
+    ).fetchall()
+    log = con.execute(
+        "SELECT quote_date, root, contracts, status, detail, ingested_at "
+        "FROM option_ingest_log ORDER BY quote_date, root"
+    ).fetchall()
+    if not quotes:
+        return {"synced": False, "reason": "no quotes"}
+
+    cal = xc.get_calendar(CALENDAR)
+    lo = max(min(r[0] for r in quotes), cal.first_session.date())
+    hi = min(max(r[0] for r in quotes), cal.last_session.date())
+    sessions = [(d.date(), CALENDAR) for d in cal.sessions_in_range(lo, hi)]
+
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO market.trading_day (session_date, venue) "
+                    "VALUES (%s, %s) ON CONFLICT (session_date) DO NOTHING",
+                    sessions,
+                )
+                # Replace wholesale rather than upserting row by row: the store
+                # is the source of truth and two thirds of a million
+                # round-tripped INSERTs is minutes, not seconds.
+                cur.execute("TRUNCATE market.option_quote")
+                with cur.copy(
+                    f"COPY market.option_quote ({cols}) FROM STDIN"
+                ) as copy:
+                    for row in quotes:
+                        copy.write_row(row)
+                cur.execute("TRUNCATE market.option_ingest_log")
+                with cur.copy(
+                    "COPY market.option_ingest_log (quote_date, root, contracts, "
+                    "status, detail, ingested_at) FROM STDIN"
+                ) as copy:
+                    for row in log:
+                        copy.write_row(row)
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        return {"synced": False, "reason": str(e)}
+    return {"synced": True, "quotes": len(quotes), "log": len(log)}
 
 
 def export(con, path: Path | None = None) -> Path:

@@ -149,3 +149,81 @@ fn int_at(b: &arrow::record_batch::RecordBatch, i: usize, row: usize) -> Option<
         .downcast_ref::<Int64Array>()
         .map(|a| i32::try_from(a.value(row)).unwrap_or(i32::MAX))
 }
+
+/// Load the same [`Chain`] from `market.option_quote`.
+///
+/// The pipeline downstream is synchronous and CPU-bound, so rather than
+/// colouring it async the runtime is created here and dropped when the query
+/// returns. One statement, one await, one allocation of the whole result --
+/// the same residency the file loader already assumes.
+pub fn load_postgres(dsn: &str, root: Option<&str>) -> Result<Chain, SurfaceError> {
+    use sqlx::Row;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| SurfaceError::Io("tokio runtime".into(), e))?;
+
+    runtime.block_on(async {
+        let pool = sqlx::PgPool::connect(dsn)
+            .await
+            .map_err(|e| SurfaceError::Database(e.to_string()))?;
+
+        // `mid`, `strike` and `tte` are what the fit needs; a row missing any
+        // of them is skipped exactly as the file loader skips nulls.
+        let rows = sqlx::query(
+            "SELECT quote_date, root, expiry, opt_right, strike, mid,
+                    rel_spread, tte, bid_size, ask_size, last_update_ts
+             FROM market.option_quote
+             WHERE ($1::text IS NULL OR root = $1)
+               AND strike IS NOT NULL AND mid IS NOT NULL AND tte IS NOT NULL
+             ORDER BY quote_date, root, expiry",
+        )
+        .bind(root)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| SurfaceError::Database(e.to_string()))?;
+
+        let mut chain: Chain = BTreeMap::new();
+        for row in &rows {
+            let quote_date: NaiveDate = row.get("quote_date");
+            let root: String = row.get("root");
+            let expiry: NaiveDate = row.get("expiry");
+            let right: String = row.get("opt_right");
+            let tte: f64 = row.get("tte");
+
+            // A quote is only as deep as its thinner side; either size absent
+            // means no weight hint, matching the file loader.
+            let size = match (
+                row.get::<Option<i32>, _>("bid_size"),
+                row.get::<Option<i32>, _>("ask_size"),
+            ) {
+                (Some(b), Some(a)) => f64::from(b.min(a)),
+                _ => 0.0,
+            };
+            let stale = row
+                .get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_update_ts")
+                .is_none();
+
+            let q = Quote {
+                right: if right == "C" { OptionRight::Call } else { OptionRight::Put },
+                strike: row.get("strike"),
+                mid: row.get("mid"),
+                rel_spread: row
+                    .get::<Option<f64>, _>("rel_spread")
+                    .unwrap_or(f64::NAN),
+                size,
+                stale,
+            };
+            chain
+                .entry((quote_date, root))
+                .or_default()
+                .entry(expiry)
+                .or_insert_with(|| (tte, Vec::new()))
+                .1
+                .push(q);
+        }
+        Ok(chain)
+    })
+}

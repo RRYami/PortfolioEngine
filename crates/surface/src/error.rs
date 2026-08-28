@@ -7,6 +7,7 @@ pub enum SurfaceError {
     Arrow(arrow::error::ArrowError),
     MissingColumn(String),
     BadColumn(&'static str),
+    Database(String),
 }
 
 impl fmt::Display for SurfaceError {
@@ -17,6 +18,7 @@ impl fmt::Display for SurfaceError {
             Self::Arrow(e) => write!(f, "arrow: {e}"),
             Self::MissingColumn(c) => write!(f, "options.parquet has no `{c}` column"),
             Self::BadColumn(c) => write!(f, "column `{c}` has an unexpected arrow type"),
+            Self::Database(e) => write!(f, "database: {e}"),
         }
     }
 }

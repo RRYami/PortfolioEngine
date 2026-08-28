@@ -27,7 +27,16 @@ import psycopg
 
 DEFAULT_DSN = "postgres://ptf:ptf@localhost:5433/ptf_engine"
 PRICES_DB = "data/prices.duckdb"
+OPTIONS_DB = "data/options.duckdb"
 VENUE = "XNYS"
+
+# Columns of market.option_quote, in table order.
+QUOTE_COLUMNS = [
+    "quote_date", "root", "expiry", "opt_right", "strike",
+    "instrument_id", "raw_symbol", "bid", "ask", "mid",
+    "rel_spread", "tte", "snapshot_ts", "bid_size", "ask_size",
+    "last_update_ts",
+]
 
 # Seed a year either side of the data so a later backfill or a fresh fetch does
 # not immediately hit a missing session.
@@ -45,6 +54,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dsn", default=os.environ.get("DATABASE_URL", DEFAULT_DSN))
     ap.add_argument("--db", default=PRICES_DB)
+    ap.add_argument("--options-db", default=OPTIONS_DB)
     ap.add_argument("--apply", action="store_true")
     args = ap.parse_args()
 
@@ -123,7 +133,69 @@ def main() -> int:
     print(f"\nloaded: {n_cal:,} sessions, {n_eq:,} closes, {n_fx:,} fx rows")
     ok = n_eq == len(closes) and n_fx == len(fx)
     print("counts match source" if ok else "COUNT MISMATCH")
+
+    if os.path.exists(args.options_db):
+        ok = load_options(args.dsn, args.options_db, known) and ok
+
     return 0 if ok else 1
+
+
+def load_options(dsn: str, db: str, sessions: set[dt.date]) -> bool:
+    """Copy option quotes and the ingest log.
+
+    COPY rather than executemany: two thirds of a million rows through
+    round-tripped INSERTs takes minutes, and there is no upsert to do on a
+    first load.
+    """
+    duck = duckdb.connect(db, read_only=True)
+    cols = ", ".join(QUOTE_COLUMNS)
+    quotes = duck.execute(f"SELECT {cols} FROM option_quotes").fetchall()
+    log = duck.execute(
+        "SELECT quote_date, root, contracts, status, detail, ingested_at "
+        "FROM option_ingest_log"
+    ).fetchall()
+
+    orphans = sorted({r[0] for r in quotes} - sessions)
+    if orphans:
+        print(f"\n{len(orphans)} option session(s) are not {VENUE} sessions: "
+              f"{orphans[:5]}", file=sys.stderr)
+        return False
+
+    # The log deliberately carries non-trading days -- recording that a session
+    # was a holiday is its purpose -- so it has no foreign key and needs no
+    # check here.
+    holidays = sum(1 for r in log if r[0] not in sessions)
+
+    print(f"\noptions: {len(quotes):,} quotes, {len(log)} log rows "
+          f"({holidays} on non-sessions, as expected)")
+
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE market.option_quote")
+            with cur.copy(
+                f"COPY market.option_quote ({cols}) FROM STDIN"
+            ) as copy:
+                for row in quotes:
+                    copy.write_row(row)
+            cur.execute("TRUNCATE market.option_ingest_log")
+            with cur.copy(
+                "COPY market.option_ingest_log "
+                "(quote_date, root, contracts, status, detail, ingested_at) "
+                "FROM STDIN"
+            ) as copy:
+                for row in log:
+                    copy.write_row(row)
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM market.option_quote")
+            n_q = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM market.option_ingest_log")
+            n_l = cur.fetchone()[0]
+
+    ok = n_q == len(quotes) and n_l == len(log)
+    print(f"loaded: {n_q:,} quotes, {n_l} log rows — "
+          + ("counts match source" if ok else "COUNT MISMATCH"))
+    return ok
 
 
 if __name__ == "__main__":
