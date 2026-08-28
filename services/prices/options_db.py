@@ -269,7 +269,12 @@ def sync_postgres(con, dsn: str | None = None) -> dict:
 
 
 def export(con, path: Path | None = None) -> Path:
-    """Consolidate the store into one parquet — the engine-facing artifact."""
+    """Consolidate the store into one parquet.
+
+    No longer part of the ingest: `ptf-surface` reads `market.option_quote`,
+    and falls back to the archive rather than to a separate export. Kept for
+    ad-hoc use, but archive.py is what produces the portable copy.
+    """
     target = path or OPTIONS_PARQUET
     target.parent.mkdir(parents=True, exist_ok=True)
     cols = ", ".join(COLUMNS)

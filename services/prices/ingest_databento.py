@@ -482,8 +482,7 @@ def main() -> int:
                 complete = False
                 break
         print(f"estimated spend this run: ${budget['spent']:.6f}")
-        out = options_db.export(con)
-        print(f"exported {out}: {options_db.summary(con)}")
+        print(f"stored: {options_db.summary(con)}")
         # ptf-surface reads market.option_quote when DATABASE_URL is set, so a
         # backfill that stopped at DuckDB would leave the fitted surface stale.
         pg = options_db.sync_postgres(con)

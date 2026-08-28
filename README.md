@@ -59,21 +59,30 @@ than the premium.
 
 So options are driven by their **underlying**, and revalued through a
 volatility surface fitted offline. The pipeline runs in five stages, each
-writing a Parquet artifact the next one reads:
+producing a table the next one reads:
 
 | Stage | Produces | What it does |
 |---|---|---|
-| Ingest (`services/prices/ingest_databento.py`) | `options.parquet` | One 15:45 ET chain snapshot per session from Databento OPRA, with quote sizes and a staleness marker |
-| Forwards | `option_forwards.parquet` | Recovers `F` and `DF` per expiry by put-call parity — no external rate curve or dividend estimate |
-| Smiles | `vol_surface_params.parquet` | One SVI slice per expiry, so the smile can be read *between* listed strikes |
-| Grid | `vol_grid.parquet` | Resamples onto fixed standardised-moneyness and constant-maturity axes, so a cell means the same thing on consecutive days |
-| Factors | `vol_pca_loadings.parquet`, `vol_pca_scores.parquet` | Three principal components of daily log-vol changes: level, skew rotation, term-structure interaction |
+| Ingest (`services/prices/ingest_databento.py`) | `market.option_quote` | One 15:45 ET chain snapshot per session from Databento OPRA, with quote sizes and a staleness marker |
+| Forwards | `vol.forward_curve` | Recovers `F` and `DF` per expiry by put-call parity — no external rate curve or dividend estimate |
+| Smiles | `vol.svi_slice` | One SVI slice per expiry, so the smile can be read *between* listed strikes |
+| Grid | `vol.grid_cell` | Resamples onto fixed standardised-moneyness and constant-maturity axes, so a cell means the same thing on consecutive days |
+| Factors | `vol.pca_loading`, `vol.pca_score` | Three principal components of daily log-vol changes: level, skew rotation, term-structure interaction |
 
 Stages 2-5 are one command:
 
 ```bash
-cargo run --release -p ptf-surface        # reads options.parquet, writes the other five
+DATABASE_URL=... cargo run --release -p ptf-surface
 ```
+
+Every artifact belongs to a **run**. `ptf-surface` writes one under a fresh
+`run_id` and promotes it in the same transaction, so a build is invisible until
+it is complete; the API reads through `vol.current_run`, and rolling back a bad
+fit is an update to one row. Without `DATABASE_URL` the same command writes the
+six Parquet files instead and the API falls back to reading them, which is the
+no-database path — it reads the chain from
+`services/prices/data/archive/latest/`, the verified archive, rather than from a
+separate export.
 
 At risk time the engine loads only the small artifacts it needs — forwards and
 factors, about 4,300 rows against the 469,000 quotes they were built from — and
@@ -252,7 +261,7 @@ ptf_engine/
         surface_source.rs  # loads the surface artifacts into a VolSurfaceProvider
     surface/              # offline surface builder (ptf-surface)
       src/
-        main.rs            # CLI: options.parquet -> forwards, smiles, grid, factors
+        main.rs            # CLI: option quotes -> forwards, smiles, grid, factors
         quotes.rs          # reads the ingested chain
         build.rs           # per-session forwards, IV cloud, SVI slices, grid sampling
         factors.rs         # assembles the PCA panel and fits it per root

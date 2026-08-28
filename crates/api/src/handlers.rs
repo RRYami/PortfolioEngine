@@ -301,28 +301,39 @@ async fn add_option(
     // leave the book in a state where /risk fails outright, since an option
     // without a surface is an error rather than a skipped row — under-reporting
     // risk silently is the worse failure.
-    let dir = std::env::var("PTF_SURFACES").unwrap_or_else(|_| "services/prices/data".into());
-    let files = crate::surface_source::SurfaceFiles::in_dir(std::path::Path::new(&dir));
     let roots = HashMap::from([(req.underlying.clone(), underlying_id)]);
-    let missing = files.missing();
-    if !missing.is_empty() {
-        // The files are absent, which is a different problem from this
-        // underlying not being fitted: naming the directory turns a puzzling
-        // message into an obvious one when the API is running somewhere the
-        // relative default does not resolve, such as a container.
-        return Err(ApiError::BadRequest(format!(
-            "no surface artifacts in {} (missing: {}) — run ptf-surface, or point \
-             PTF_SURFACES at the directory holding them",
-            files.search_dir(),
-            missing.join(", ")
-        )));
+    // Only meaningful without a database: with one the surfaces live in vol.*
+    // and the files are not consulted at all, so their absence is not an
+    // error and must not be reported as one.
+    let files = (app.pool.is_none()).then(|| {
+        let dir =
+            std::env::var("PTF_SURFACES").unwrap_or_else(|_| "services/prices/data".into());
+        crate::surface_source::SurfaceFiles::in_dir(std::path::Path::new(&dir))
+    });
+    if let Some(files) = files.as_ref() {
+        let missing = files.missing();
+        if !missing.is_empty() {
+            // Absent files are a different problem from this underlying not
+            // being fitted: naming the directory turns a puzzling message into
+            // an obvious one when the API runs somewhere the relative default
+            // does not resolve, such as a container.
+            return Err(ApiError::BadRequest(format!(
+                "no surface artifacts in {} (missing: {}) — run ptf-surface, or point \
+                 PTF_SURFACES at the directory holding them",
+                files.search_dir(),
+                missing.join(", ")
+            )));
+        }
     }
     let surfaces = load_surfaces(&app, &roots, Utc::now().date_naive()).await;
     if surfaces.is_empty() {
+        let source = files.as_ref().map_or_else(
+            || "vol.current_run".to_string(),
+            crate::surface_source::SurfaceFiles::search_dir,
+        );
         return Err(ApiError::BadRequest(format!(
-            "surface artifacts in {} contain no fitted surface for {} — ingest its \
-             option chains and re-run ptf-surface",
-            files.search_dir(),
+            "no fitted surface for {} in {source} — ingest its option chains and \
+             re-run ptf-surface",
             req.underlying
         )));
     }

@@ -260,8 +260,18 @@ def build(out_dir: Path, freeze: bool) -> int:
             n += 1
         print(f"froze {n} paths under {RAW} (read-only)")
 
+    # `latest` is what tools point at, so a fallback path does not have to
+    # know today's date. Replaced rather than updated: a symlink swap is
+    # atomic, so nothing ever observes it pointing at a partial archive.
+    link = out_dir.parent / "latest"
+    tmp = out_dir.parent / ".latest.new"
+    tmp.unlink(missing_ok=True)
+    tmp.symlink_to(out_dir.name)
+    tmp.replace(link)
+
     total = sum(a["bytes"] for a in artifacts)
     print(f"\narchive written to {out_dir}  ({total/1e6:.1f} MB + manifest)")
+    print(f"latest -> {out_dir.name}")
     return 0
 
 

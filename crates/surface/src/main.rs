@@ -28,7 +28,9 @@ use std::process::ExitCode;
 
 use build::Rejects;
 
-const DEFAULT_IN: &str = "services/prices/data/options.parquet";
+/// The archive, not a separate export. `latest` is a symlink the archive tool
+/// swaps atomically, so this stays valid without knowing today's date.
+const DEFAULT_IN: &str = "services/prices/data/archive/latest/option_quotes.parquet";
 const DEFAULT_OUT: &str = "services/prices/data";
 
 fn main() -> ExitCode {
@@ -64,6 +66,52 @@ fn load_chain(args: &[String], input: &std::path::Path) -> Result<quotes::Chain,
             quotes::load(input)
         }
     }
+}
+
+/// Where each artifact goes, so the reporter takes one argument instead of six.
+struct Paths<'a> {
+    fwd: &'a std::path::Path,
+    iv: &'a std::path::Path,
+    svi: &'a std::path::Path,
+    grid: &'a std::path::Path,
+    load: &'a std::path::Path,
+    score: &'a std::path::Path,
+}
+
+/// Say what actually happened. When a run is published to Postgres no files
+/// are written, and claiming otherwise would send someone looking for them.
+fn report(
+    wrote: bool,
+    p: &Paths<'_>,
+    forwards: &[build::ForwardRow],
+    ivs: &[build::IvRow],
+    svis: &[build::SviRow],
+    grid: &[build::GridRow],
+    sessions: usize,
+) {
+    let arb = svis.iter().filter(|s| s.min_durrleman < 0.0).count();
+    let worst = svis.iter().map(|s| s.rmse_vol).fold(0.0_f64, f64::max);
+    let verb = if wrote { "wrote" } else { "fitted" };
+    let name = |path: &std::path::Path| {
+        if wrote {
+            path.display().to_string()
+        } else {
+            path.file_stem()
+                .map_or_else(String::new, |s| s.to_string_lossy().into_owned())
+        }
+    };
+    eprintln!(
+        "{verb} {} ({} slices), {} ({} points), {} ({} smiles, {arb} with a butterfly \
+         violation, worst fit {:.4} vol pts)",
+        name(p.fwd), forwards.len(), name(p.iv), ivs.len(), name(p.svi), svis.len(), worst
+    );
+    let extrap = grid.iter().filter(|g| g.extrapolated).count();
+    let expected = build::GRID_Z.len() * build::GRID_TAU.len() * sessions;
+    eprintln!(
+        "{verb} {} ({} cells of {expected} possible, {extrap} extrapolated)",
+        name(p.grid), grid.len()
+    );
+    eprintln!("{verb} {} and {}", name(p.load), name(p.score));
 }
 
 fn run() -> Result<(), error::SurfaceError> {
@@ -108,14 +156,24 @@ fn run() -> Result<(), error::SurfaceError> {
         grid.extend(out.grid);
     }
 
+    // Parquet is the no-database serving path. When a run is published to
+    // Postgres the API reads that instead, and writing the files anyway would
+    // leave six artifacts on disk that look current and are not -- the same
+    // kind of quietly-stale copy this whole migration exists to remove.
+    let publishing = std::env::var("DATABASE_URL").is_ok()
+        && !args.iter().any(|a| a == "--no-publish");
+    let write_files = !publishing || args.iter().any(|a| a == "--write-parquet");
+
     let fwd_path = out.join("option_forwards.parquet");
     let iv_path = out.join("option_iv.parquet");
     let svi_path = out.join("vol_surface_params.parquet");
     let grid_path = out.join("vol_grid.parquet");
-    write::forwards(&fwd_path, &forwards)?;
-    write::ivs(&iv_path, &ivs)?;
-    write::svis(&svi_path, &svis)?;
-    write::grid(&grid_path, &grid)?;
+    if write_files {
+        write::forwards(&fwd_path, &forwards)?;
+        write::ivs(&iv_path, &ivs)?;
+        write::svis(&svi_path, &svis)?;
+        write::grid(&grid_path, &grid)?;
+    }
 
     let fits = fit_factors(&grid);
     // Backtest: only meaningful once there is history to hold out.
@@ -125,14 +183,17 @@ fn run() -> Result<(), error::SurfaceError> {
 
     let load_path = out.join("vol_pca_loadings.parquet");
     let score_path = out.join("vol_pca_scores.parquet");
-    write::pca_loadings(&load_path, &fits)?;
-    write::pca_scores(&score_path, &fits)?;
+    if write_files {
+        write::pca_loadings(&load_path, &fits)?;
+        write::pca_scores(&score_path, &fits)?;
+    }
 
     // Publish last, once every artifact is in hand. A run becomes visible to
     // the API only when its own transaction commits, so a build that dies
     // partway leaves the previous fit serving rather than a half-written one.
-    if let Ok(dsn) = std::env::var("DATABASE_URL") {
-        if !args.iter().any(|a| a == "--no-publish") {
+    if publishing {
+        {
+            let dsn = std::env::var("DATABASE_URL").unwrap_or_default();
             let config = format!(
                 "{{\"components\":{},\"sessions\":{},\"quotes\":{}}}",
                 fits.first().map_or(0, |f| f.fit.components()),
@@ -147,27 +208,12 @@ fn run() -> Result<(), error::SurfaceError> {
         }
     }
 
-    let arb = svis.iter().filter(|s| s.min_durrleman < 0.0).count();
-    let worst = svis.iter().map(|s| s.rmse_vol).fold(0.0_f64, f64::max);
-    eprintln!(
-        "wrote {} ({} slices), {} ({} points), {} ({} smiles, {arb} with a butterfly \
-         violation, worst fit {:.4} vol pts)",
-        fwd_path.display(),
-        forwards.len(),
-        iv_path.display(),
-        ivs.len(),
-        svi_path.display(),
-        svis.len(),
-        worst
+    report(
+        write_files,
+        &Paths { fwd: &fwd_path, iv: &iv_path, svi: &svi_path, grid: &grid_path,
+                 load: &load_path, score: &score_path },
+        &forwards, &ivs, &svis, &grid, chain.len(),
     );
-    let extrap = grid.iter().filter(|g| g.extrapolated).count();
-    let expected = build::GRID_Z.len() * build::GRID_TAU.len() * chain.len();
-    eprintln!(
-        "wrote {} ({} cells of {expected} possible, {extrap} extrapolated)",
-        grid_path.display(),
-        grid.len()
-    );
-    eprintln!("wrote {} and {}", load_path.display(), score_path.display());
     eprintln!(
         "rejected: {} itm, {} unstable, {} below intrinsic, {} above ceiling, \
          {} other, {} no forward; {no_curve} sessions without a curve",

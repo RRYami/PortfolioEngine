@@ -47,14 +47,14 @@ services:
       context: .
       dockerfile: crates/api/Dockerfile
     environment:
-      PTF_PRICES: parquet
+      PTF_PRICES: postgres
       PRICES_URL: http://prices:8001
+      # Only read when DATABASE_URL is absent. Kept so the no-database path
+      # still works in the container: without PTF_SURFACES the fallback
+      # resolves relative to the working directory, which does not exist here,
+      # and every option add fails as though no surface had been built.
       PRICES_PARQUET: /data/prices.parquet
       FX_PARQUET: /data/fx.parquet
-      # Surface artifacts live beside the price snapshot on the shared volume.
-      # Without this the API falls back to a path relative to its working
-      # directory, which does not exist in the container, and every option add
-      # fails as though the surface had never been built.
       PTF_SURFACES: /data
       PTF_API_ADDR: 0.0.0.0:8080
       DATABASE_URL: postgres://ptf:ptf@postgres:5432/ptf_engine

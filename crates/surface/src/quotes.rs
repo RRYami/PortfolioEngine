@@ -134,16 +134,30 @@ fn f64_col<'a>(
         .ok_or(SurfaceError::BadColumn(name))
 }
 
-/// Sizes arrive as `INTEGER` from `DuckDB` but the writer's width is not
-/// guaranteed, so accept either 32- or 64-bit rather than failing the load.
+/// Sizes arrive as `INTEGER` from `DuckDB` but the writer's width and
+/// signedness are not guaranteed, so accept any of the four rather than
+/// failing the load.
+///
+/// The unsigned arms matter: the raw vendor snapshots store sizes as
+/// `UINTEGER`, and only the round trip through `DuckDB`'s signed `INTEGER`
+/// column made them readable. Reading a raw partition directly -- or the
+/// archive, which preserves the vendor types -- silently yielded a size of
+/// zero for every row, because a failed downcast is indistinguishable from an
+/// absent value here.
 fn int_at(b: &arrow::record_batch::RecordBatch, i: usize, row: usize) -> Option<i32> {
-    use arrow::array::{Int32Array, Int64Array};
+    use arrow::array::{Int32Array, Int64Array, UInt32Array, UInt64Array};
     let c = b.column(i);
     if c.is_null(row) {
         return None;
     }
     if let Some(a) = c.as_any().downcast_ref::<Int32Array>() {
         return Some(a.value(row));
+    }
+    if let Some(a) = c.as_any().downcast_ref::<UInt32Array>() {
+        return Some(i32::try_from(a.value(row)).unwrap_or(i32::MAX));
+    }
+    if let Some(a) = c.as_any().downcast_ref::<UInt64Array>() {
+        return Some(i32::try_from(a.value(row)).unwrap_or(i32::MAX));
     }
     c.as_any()
         .downcast_ref::<Int64Array>()
