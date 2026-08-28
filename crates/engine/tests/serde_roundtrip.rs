@@ -8,9 +8,9 @@ mod serde_tests {
 
     use ptf_engine::fold;
     use ptf_engine::{
-        CorporateAction, Currency, InstrumentId, LotId, LotMethod, LotSelection, LotSelectionEntry,
-        LotSide, Money, PortfolioConfig, PortfolioState, Transaction, TransactionId,
-        TransactionKind, UserId,
+        CorporateAction, Currency, ExerciseStyle, InstrumentId, InstrumentKind, LotId, LotMethod,
+        LotSelection, LotSelectionEntry, LotSide, Money, PortfolioConfig, PortfolioState,
+        Transaction, TransactionId, TransactionKind, UserId,
     };
 
     fn usd(amount: &str) -> Money {
@@ -415,5 +415,26 @@ mod serde_tests {
         let json = serde_json::to_string(&state).unwrap();
         let decoded: PortfolioState = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, state);
+    }
+
+    /// Persistence stores the kind as a `Json<InstrumentKind>` column, so a
+    /// round-trip failure here is a database read that cannot be decoded.
+    #[test]
+    fn instrument_kind_round_trips() {
+        for kind in [
+            InstrumentKind::Equity {},
+            InstrumentKind::EquityOption {
+                underlying: InstrumentId::new(),
+                right: ptf_engine::vol::OptionRight::Call,
+                strike: Decimal::from_str_exact("522.50").unwrap(),
+                expiry: chrono::NaiveDate::from_ymd_opt(2026, 9, 25).unwrap(),
+                multiplier: Decimal::from(100),
+                exercise: ExerciseStyle::American,
+            },
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: InstrumentKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, back, "{json}");
+        }
     }
 }

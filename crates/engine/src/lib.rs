@@ -43,7 +43,7 @@ pub use fx::{
 pub use grid::{FittedSlice, GridCell, sample_grid};
 pub use historical_price::{HistoricalPriceProvider, StaticHistoricalPriceProvider};
 pub use ids::{InstrumentId, LotId, PortfolioId, TransactionId, UserId};
-pub use instrument::{Instrument, InstrumentKind};
+pub use instrument::{ExerciseStyle, Instrument, InstrumentKind};
 pub use lot::Lot;
 pub use lot_method::{LotMethod, LotSelection, LotSelectionEntry, LotSide};
 pub use money::Money;
