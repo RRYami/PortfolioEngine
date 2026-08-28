@@ -17,6 +17,7 @@ a rate per day, not one rate for everything.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
 from pathlib import Path
 
@@ -25,6 +26,8 @@ import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI
 from pydantic import BaseModel
+
+log = logging.getLogger(__name__)
 
 DATA = Path(os.environ.get("PRICES_DATA") or (Path(__file__).resolve().parent / "data"))
 DATA.mkdir(parents=True, exist_ok=True)
@@ -113,6 +116,57 @@ def _is_fresh(con, symbol: str) -> bool:
     return last is not None and (dt.date.today() - last).days <= 3
 
 
+# A symbol needs at least this many peer sessions before its calendar is
+# trusted to judge another symbol's dates. Below it, a thin or brand-new
+# series would reject perfectly good rows.
+_CALENDAR_QUORUM = 200
+
+
+def _drop_non_trading_days(con, symbol: str, recs: list) -> tuple[list, list]:
+    """Split `recs` into rows on known trading days and rows on closed days.
+
+    A row dated on a day the market was shut is not a price. Synthetic demo
+    prices once leaked in on a business-day calendar -- weekends skipped but
+    not holidays -- and put NVDA on Thanksgiving 31% below the previous close.
+    That single fabricated session more than doubled its estimated volatility
+    and, since the next day's return is computed against it, injected a +36%
+    day into the risk factor panel.
+
+    The calendar is the union of dates from other symbols that already have a
+    substantial history, so it needs no hardcoded holiday list and follows
+    whatever exchange the book actually trades on. With no such peer yet,
+    everything is accepted: a first symbol has nothing to be checked against.
+    """
+    peers = [
+        r[0]
+        for r in con.execute(
+            "SELECT symbol FROM prices WHERE symbol <> ? "
+            "GROUP BY symbol HAVING count(*) >= ?",
+            [symbol, _CALENDAR_QUORUM],
+        ).fetchall()
+    ]
+    if not peers:
+        return recs, []
+
+    marks = ",".join("?" * len(peers))
+    rows = con.execute(
+        f"SELECT DISTINCT date FROM prices WHERE symbol IN ({marks})", peers
+    ).fetchall()
+    calendar = {r[0] for r in rows}
+    lo, hi = min(calendar), max(calendar)
+
+    keep, dropped = [], []
+    for rec in recs:
+        date = rec[1]
+        # Outside the peers' span there is no calendar to check against, so
+        # the row is kept rather than guessed at.
+        if lo <= date <= hi and date not in calendar:
+            dropped.append(rec)
+        else:
+            keep.append(rec)
+    return keep, dropped
+
+
 def fetch_symbol(con, symbol: str, period: str, force: bool) -> dict:
     if not force and _is_fresh(con, symbol):
         row = con.execute(
@@ -131,6 +185,18 @@ def fetch_symbol(con, symbol: str, period: str, force: bool) -> dict:
     ]
     if not recs:
         raise ValueError(f"no usable closes for {symbol}")
+
+    recs, dropped = _drop_non_trading_days(con, symbol, recs)
+    if dropped:
+        log.warning(
+            "%s: dropped %d row(s) dated on non-trading days: %s",
+            symbol,
+            len(dropped),
+            ", ".join(str(r[1]) for r in dropped[:5]),
+        )
+    if not recs:
+        raise ValueError(f"no usable closes for {symbol} on trading days")
+
     _upsert(
         con,
         "prices",
