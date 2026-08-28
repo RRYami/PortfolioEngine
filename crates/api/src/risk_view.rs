@@ -139,37 +139,33 @@ fn entry(report: &VaRReport, conf: f64, horizon: u32) -> (f64, f64) {
 
 /// Build the dashboard payload. `holdings` carries symbol/name/ccy metadata for
 /// the instruments held in `state`.
+// One more line than clippy's threshold after threading surfaces through;
+// splitting it would separate the payload's fields from where they are filled.
+#[allow(clippy::too_many_lines)]
 pub fn build(
     portfolio: &Portfolio,
     state: &PortfolioState,
     holdings: &[HeldInstrument],
     names: &std::collections::HashMap<String, String>,
     pd: &PriceData,
+    surfaces: &dyn ptf_engine::VolSurfaceProvider,
     as_of: NaiveDate,
 ) -> Result<RiskPayload, ApiError> {
     let base = portfolio.base_currency;
     let cfg = MonteCarloConfig::default_var();
     // Options are revalued through a surface rather than shocked directly, so
-    // the risk run needs both the instrument kinds and the fitted surfaces.
+    // the risk run needs the instrument kinds. The surfaces are loaded by the
+    // caller, which also uses them to mark the positions — one load, one set of
+    // prices, so the views cannot disagree.
     let kinds: std::collections::HashMap<_, _> =
         holdings.iter().map(|h| (h.id, h.kind)).collect();
-    // Roots are matched by symbol: the surface artifacts are keyed by the
-    // underlying's ticker, which is what the ingest wrote.
-    let roots: std::collections::HashMap<String, ptf_engine::InstrumentId> =
-        holdings.iter().map(|h| (h.symbol.clone(), h.id)).collect();
-    let dir = std::env::var("PTF_SURFACES")
-        .unwrap_or_else(|_| "services/prices/data".into());
-    let files = crate::surface_source::SurfaceFiles::in_dir(std::path::Path::new(&dir));
-    // Loaded per request for now. The files are small, but this is the obvious
-    // thing to cache in AppState once an options book is actually held.
-    let surfaces = crate::surface_source::load(&files, &roots, as_of);
     let report = compute_var(
         state,
         &pd.historical,
         &pd.fx,
         &pd.prices,
         &kinds,
-        &surfaces,
+        surfaces,
         &cfg,
         base,
         as_of,

@@ -54,6 +54,36 @@ pub struct AddHoldingReq {
     pub date: Option<NaiveDate>,
 }
 
+/// Buy a listed option.
+///
+/// Separate from [`AddHoldingReq`] rather than an optional block on it: an
+/// option needs five contract terms an equity has none of, and folding them in
+/// as optional fields would make every one of them silently ignorable.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddOptionReq {
+    /// Ticker of the underlying, e.g. `SOXX`. Must be something the surface
+    /// pipeline has fitted, since that is what prices the contract.
+    pub underlying: String,
+    /// `call` or `put` (also accepts `c` / `p`).
+    pub right: String,
+    pub strike: Decimal,
+    pub expiry: NaiveDate,
+    /// Number of contracts. Positive only — writing options is not reachable
+    /// through this API, the same way short-selling equities is not.
+    pub contracts: Decimal,
+    /// Premium **per share**, the way options are quoted. The cost basis is
+    /// this times the multiplier.
+    pub premium: Decimal,
+    pub currency: String,
+    /// Shares per contract. Defaults to the listed-option standard of 100.
+    pub multiplier: Option<Decimal>,
+    /// `american` (default) or `european`.
+    pub exercise: Option<String>,
+    /// Trade date; defaults to the portfolio inception date.
+    pub date: Option<NaiveDate>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SellHoldingReq {

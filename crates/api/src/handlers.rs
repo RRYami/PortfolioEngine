@@ -5,9 +5,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use ptf_engine::{
-    Currency, FxRateProvider, HistoricalPriceProvider, Instrument, InstrumentId, InstrumentKind,
-    Money, Portfolio, PortfolioConfig, PortfolioId, Transaction, TransactionId, TransactionKind,
-    UserId, fold,
+    Currency, ExerciseStyle, FxRateProvider, HistoricalPriceProvider, Instrument, InstrumentId,
+    InstrumentKind, Money, Portfolio, PortfolioConfig, PortfolioId, Transaction, TransactionId,
+    TransactionKind, UserId, fold,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -18,9 +18,8 @@ use uuid::Uuid;
 
 use crate::auth::{self, SessionUser};
 use crate::dto::{
-    AddHoldingReq, CreatePortfolioReq, PortfolioDetail, PortfolioSummary, PositionView,
-    SellHoldingReq,
-    parse_currency, parse_lot_method,
+    AddHoldingReq, AddOptionReq, CreatePortfolioReq, PortfolioDetail, PortfolioSummary,
+    PositionView, SellHoldingReq, parse_currency, parse_lot_method,
 };
 use crate::error::ApiError;
 use crate::perf_view::{self, BenchmarkSeries, PerformancePayload};
@@ -57,6 +56,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/portfolios/{id}", get(get_portfolio))
         .route("/api/portfolios/{id}/holdings", post(add_holding))
+        .route("/api/portfolios/{id}/options", post(add_option))
         .route("/api/portfolios/{id}/sell", post(sell_holding))
         .route("/api/portfolios/{id}/positions", get(get_positions))
         .route("/api/portfolios/{id}/risk", get(get_risk))
@@ -191,6 +191,168 @@ async fn add_holding(
     Ok(Json(PortfolioSummary::from(&portfolio)))
 }
 
+/// The OCC contract symbol: root padded to six, `YYMMDD`, `C`/`P`, then the
+/// strike in thousandths padded to eight.
+///
+/// Deliberately the same format the ingest writes into `raw_symbol`, so a
+/// position in the book can be matched against a row in the option chain
+/// without a translation table.
+fn occ_symbol(root: &str, expiry: chrono::NaiveDate, right: ptf_engine::vol::OptionRight,
+              strike: Decimal) -> String {
+    use chrono::Datelike;
+    let thousandths = (strike * Decimal::from(1000)).round().to_i64().unwrap_or(0);
+    format!(
+        "{:<6}{:02}{:02}{:02}{}{:08}",
+        root.to_uppercase(),
+        expiry.year() % 100,
+        expiry.month(),
+        expiry.day(),
+        right,
+        thousandths
+    )
+}
+
+fn parse_right(s: &str) -> Result<ptf_engine::vol::OptionRight, ApiError> {
+    match s.to_ascii_lowercase().as_str() {
+        "call" | "c" => Ok(ptf_engine::vol::OptionRight::Call),
+        "put" | "p" => Ok(ptf_engine::vol::OptionRight::Put),
+        other => Err(ApiError::BadRequest(format!(
+            "right must be call or put, got {other}"
+        ))),
+    }
+}
+
+fn parse_exercise(s: Option<&str>) -> Result<ExerciseStyle, ApiError> {
+    match s.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("american") => Ok(ExerciseStyle::American),
+        Some("european") => Ok(ExerciseStyle::European),
+        Some(other) => Err(ApiError::BadRequest(format!(
+            "exercise must be american or european, got {other}"
+        ))),
+    }
+}
+
+/// Buy a listed option.
+///
+/// Mirrors [`add_holding`]'s deposit-then-buy desugaring, with two differences
+/// that matter. The instrument is registered with its full contract terms, so
+/// the risk engine can revalue it through a surface instead of shocking it like
+/// a stock. And the underlying is registered and price-ensured too, because an
+/// option is priced as a function of its underlying and the risk run needs that
+/// history whether or not the underlying is itself held.
+async fn add_option(
+    user: SessionUser,
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AddOptionReq>,
+) -> Result<Json<PortfolioSummary>, ApiError> {
+    let pid = parse_id(&id)?;
+    let portfolio = owned_portfolio(&app, user.0.id, pid).await?;
+    let ccy = parse_currency(&req.currency)?;
+    let right = parse_right(&req.right)?;
+    let exercise = parse_exercise(req.exercise.as_deref())?;
+    let multiplier = req.multiplier.unwrap_or_else(|| Decimal::from(100));
+
+    if req.contracts <= Decimal::ZERO {
+        return Err(ApiError::BadRequest(
+            "contracts must be positive — writing options is not supported here".into(),
+        ));
+    }
+    if req.strike <= Decimal::ZERO {
+        return Err(ApiError::BadRequest("strike must be positive".into()));
+    }
+    if req.premium <= Decimal::ZERO {
+        return Err(ApiError::BadRequest("premium must be positive".into()));
+    }
+    if multiplier <= Decimal::ZERO {
+        return Err(ApiError::BadRequest("multiplier must be positive".into()));
+    }
+    let date = req.date.unwrap_or(portfolio.inception_date);
+    if req.expiry <= date {
+        return Err(ApiError::BadRequest(format!(
+            "expiry {} must be after the trade date {date}",
+            req.expiry
+        )));
+    }
+
+    // The underlying has to exist as an instrument and have price history: the
+    // risk run drives the option off the underlying's returns, not the
+    // option's own.
+    ensure_prices(&app, &req.underlying).await?;
+    let underlying_id = if let Ok(existing) = app.instruments.by_symbol(&req.underlying).await {
+        existing.id
+    } else {
+        let inst = Instrument {
+            id: InstrumentId::new(),
+            symbol: req.underlying.clone(),
+            name: req.underlying.clone(),
+            currency: ccy,
+            kind: InstrumentKind::Equity {},
+        };
+        app.instruments.upsert(&inst).await?;
+        inst.id
+    };
+
+    // Refuse a position the risk engine could not price. Accepting it would
+    // leave the book in a state where /risk fails outright, since an option
+    // without a surface is an error rather than a skipped row — under-reporting
+    // risk silently is the worse failure.
+    let dir = std::env::var("PTF_SURFACES").unwrap_or_else(|_| "services/prices/data".into());
+    let files = crate::surface_source::SurfaceFiles::in_dir(std::path::Path::new(&dir));
+    let roots = HashMap::from([(req.underlying.clone(), underlying_id)]);
+    let surfaces = crate::surface_source::load(&files, &roots, Utc::now().date_naive());
+    if surfaces.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "no fitted volatility surface for {} — build it with ptf-surface before \
+             holding options on this underlying",
+            req.underlying
+        )));
+    }
+
+    let symbol = occ_symbol(&req.underlying, req.expiry, right, req.strike);
+    let inst_id = if let Ok(existing) = app.instruments.by_symbol(&symbol).await {
+        existing.id
+    } else {
+        let inst = Instrument {
+            id: InstrumentId::new(),
+            symbol: symbol.clone(),
+            name: format!(
+                "{} {} {} {}",
+                req.underlying.to_uppercase(),
+                req.expiry,
+                right,
+                req.strike.normalize()
+            ),
+            currency: ccy,
+            kind: InstrumentKind::EquityOption {
+                underlying: underlying_id,
+                right,
+                strike: req.strike,
+                expiry: req.expiry,
+                multiplier,
+                exercise,
+            },
+        };
+        app.instruments.upsert(&inst).await?;
+        inst.id
+    };
+
+    // Quotes are per share; a contract costs the premium times the multiplier,
+    // and the position is measured in contracts. Getting this pairing wrong is
+    // the hundred-fold error the multiplier exists to prevent.
+    let cost_per_contract = req.premium * multiplier;
+    let cost = Money::new(cost_per_contract, ccy);
+    let zero = Money::new(Decimal::ZERO, ccy);
+    let deposit = TransactionKind::deposit(Money::new(req.contracts * cost_per_contract, ccy))?;
+    let buy = TransactionKind::buy(inst_id, req.contracts, cost, zero, None)?;
+    let dep_tx = Transaction::new(TransactionId::new(), date, date, deposit)?;
+    let buy_tx = Transaction::new(TransactionId::new(), date, date, buy)?;
+    app.transactions.append(pid, &dep_tx).await?;
+    app.transactions.append(pid, &buy_tx).await?;
+
+    Ok(Json(PortfolioSummary::from(&portfolio)))
+}
+
 /// Sell some or all of a position.
 ///
 /// The mirror of [`add_holding`]'s deposit+buy desugaring: a `Sell` plus a
@@ -267,10 +429,12 @@ async fn get_risk(
 
     let as_of = Utc::now().date_naive();
     let lookback = ptf_engine::MonteCarloConfig::default_var().lookback_days;
-    let pd = app
+    let mut pd = app
         .prices
         .build(&holdings, portfolio.base_currency, as_of, lookback)?;
-    let payload = risk_view::build(&portfolio, &state, &holdings, &names, &pd, as_of)?;
+    let surfaces = mark_options(&holdings, &mut pd, as_of);
+    let payload =
+        risk_view::build(&portfolio, &state, &holdings, &names, &pd, &surfaces, as_of)?;
     Ok(Json(payload))
 }
 
@@ -288,9 +452,11 @@ async fn get_positions(
     // Positions only need spot + FX; reuse the same lookback so parquet/synthetic
     // sources have a valid window to source the latest close from.
     let lookback = ptf_engine::MonteCarloConfig::default_var().lookback_days;
-    let pd = app
+    let mut pd = app
         .prices
         .build(&holdings, portfolio.base_currency, as_of, lookback)?;
+    // Options have no price feed of their own; they are marked from the surface.
+    let _ = mark_options(&holdings, &mut pd, as_of);
     let payload = positions_view::build(&portfolio, &state, &holdings, &names, &pd, as_of)?;
     Ok(Json(payload))
 }
@@ -407,8 +573,31 @@ async fn gather_holdings(
 ) -> (Vec<HeldInstrument>, HashMap<String, String>) {
     let mut holdings = Vec::new();
     let mut names = HashMap::new();
+    let mut underlyings: Vec<InstrumentId> = Vec::new();
     for inst_id in state.positions().keys() {
         if let Ok(inst) = app.instruments.get(*inst_id).await {
+            names.insert(inst.symbol.clone(), inst.name.clone());
+            if let Some(u) = inst.kind.underlying() {
+                underlyings.push(u);
+            }
+            holdings.push(HeldInstrument {
+                id: inst.id,
+                symbol: inst.symbol,
+                currency: inst.currency,
+                kind: inst.kind,
+            });
+        }
+    }
+    // The underlying of a held option is not itself a position, but the risk
+    // run needs its price history (an option is driven by its underlying's
+    // returns, not its own) and its surface is keyed by that ticker. It only
+    // adds metadata: rows are built from the folded positions, so this cannot
+    // create a phantom holding.
+    for u in underlyings {
+        if holdings.iter().any(|h| h.id == u) {
+            continue;
+        }
+        if let Ok(inst) = app.instruments.get(u).await {
             names.insert(inst.symbol.clone(), inst.name.clone());
             holdings.push(HeldInstrument {
                 id: inst.id,
@@ -419,6 +608,68 @@ async fn gather_holdings(
         }
     }
     (holdings, names)
+}
+
+/// Load the fitted surfaces for whatever underlyings this book needs, and mark
+/// every option position from them.
+///
+/// Marking here rather than in each view is what keeps the book consistent: the
+/// positions page, the portfolio value and the risk run all read the same
+/// `PriceProvider`, so they cannot disagree about what an option is worth. The
+/// mark is the same model that revalues it on every simulated path, so a
+/// reported P&L is risk rather than risk plus a mark-to-model gap.
+fn mark_options(
+    holdings: &[HeldInstrument],
+    pd: &mut crate::price_source::PriceData,
+    as_of: chrono::NaiveDate,
+) -> ptf_engine::StaticVolSurfaceProvider {
+    use ptf_engine::PriceProvider;
+    use ptf_engine::surface::VolSurfaceProvider;
+
+    let roots: HashMap<String, InstrumentId> = holdings
+        .iter()
+        .filter(|h| !h.kind.is_derivative())
+        .map(|h| (h.symbol.clone(), h.id))
+        .collect();
+    let dir = std::env::var("PTF_SURFACES").unwrap_or_else(|_| "services/prices/data".into());
+    let files = crate::surface_source::SurfaceFiles::in_dir(std::path::Path::new(&dir));
+    let surfaces = crate::surface_source::load(&files, &roots, as_of);
+
+    for h in holdings.iter().filter(|h| h.kind.is_derivative()) {
+        let InstrumentKind::EquityOption { underlying, right, .. } = h.kind else { continue };
+        let (Some(strike), Some(tte)) = (h.kind.strike_f64(), h.kind.year_fraction(as_of)) else {
+            continue;
+        };
+        let Some(snapshot) = surfaces.surface(underlying, as_of) else { continue };
+        let Some(per_contract) = snapshot.price_contract(right, strike, tte, 1.0, &[]) else {
+            continue;
+        };
+        // A surface fitted for one price level against a feed quoting another
+        // is a silent misvaluation: the option marks off the surface's forward
+        // while the stock marks off the feed, so a mixed book is sized wrong.
+        // It is loud rather than fatal because the *risk* still works -- the
+        // underlying drives the option through a return, which is scale-free.
+        if let (Ok(spot), Some(front)) = (
+            pd.prices.price(underlying, as_of),
+            snapshot.forwards.first().map(|f| f.1),
+        ) {
+            let spot = spot.amount.to_f64().unwrap_or(0.0);
+            if spot > 0.0 && (front / spot).max(spot / front) > 1.25 {
+                tracing::warn!(
+                    symbol = %h.symbol,
+                    spot,
+                    forward = front,
+                    "price feed and volatility surface disagree about the underlying's level"
+                );
+            }
+        }
+        let mult = h.kind.multiplier().to_f64().unwrap_or(1.0);
+        if let Some(amount) = Decimal::from_f64_retain(per_contract * mult) {
+            pd.prices
+                .insert(h.id, as_of, Money::new(amount.round_dp(6), h.currency));
+        }
+    }
+    surfaces
 }
 
 async fn fold_state(
@@ -468,5 +719,53 @@ async fn ensure_prices(app: &AppState, ticker: &str) -> Result<(), ApiError> {
         _ => Err(ApiError::BadRequest(format!(
             "ticker '{symbol}' not found — check the symbol and try again"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ptf_engine::vol::OptionRight;
+
+    fn day(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    /// Pinned against real rows from the option store, so a position in the
+    /// book can be matched to a row in the chain without translation.
+    #[test]
+    fn occ_symbols_match_the_ingested_chain() {
+        assert_eq!(
+            occ_symbol("SOXX", day(2026, 7, 17), OptionRight::Call, Decimal::from(520)),
+            "SOXX  260717C00520000"
+        );
+        assert_eq!(
+            occ_symbol("SOXX", day(2025, 8, 29), OptionRight::Call, Decimal::from(160)),
+            "SOXX  250829C00160000"
+        );
+        // Fractional strikes survive the thousandths encoding.
+        assert_eq!(
+            occ_symbol("spy", day(2026, 1, 16), OptionRight::Put, Decimal::from_str_exact("522.50").unwrap()),
+            "SPY   260116P00522500"
+        );
+        // A long root fills the field without shifting the tail.
+        assert_eq!(
+            occ_symbol("GOOGL", day(2026, 3, 20), OptionRight::Call, Decimal::from(200)),
+            "GOOGL 260320C00200000"
+        );
+    }
+
+    #[test]
+    fn right_and_exercise_parse_forgivingly_but_not_loosely() {
+        assert_eq!(parse_right("call").unwrap(), OptionRight::Call);
+        assert_eq!(parse_right("C").unwrap(), OptionRight::Call);
+        assert_eq!(parse_right("Put").unwrap(), OptionRight::Put);
+        assert_eq!(parse_right("p").unwrap(), OptionRight::Put);
+        assert!(parse_right("straddle").is_err());
+        assert!(parse_right("").is_err());
+
+        assert_eq!(parse_exercise(None).unwrap(), ExerciseStyle::American);
+        assert_eq!(parse_exercise(Some("EUROPEAN")).unwrap(), ExerciseStyle::European);
+        assert!(parse_exercise(Some("bermudan")).is_err());
     }
 }

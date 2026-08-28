@@ -92,8 +92,13 @@ pub enum RiskError {
     InvalidCovariance,
     #[error("FX rate unavailable for VaR conversion")]
     FxUnavailable(#[from] crate::fx::FxError),
-    #[error("price error")]
+    #[error("price error: {0}")]
     Price(#[from] crate::price::PriceError),
+    /// No fitted surface for an option's underlying. Distinct from a missing
+    /// price because the fix is different: build the surface, do not fetch a
+    /// quote.
+    #[error("no volatility surface for the underlying of {0:?}")]
+    SurfaceUnavailable(InstrumentId),
 }
 
 // ------------------------------------------------------------------
@@ -404,6 +409,15 @@ pub fn compute_var(
 // Internal helpers
 // ------------------------------------------------------------------
 
+/// Fewest observations a factor panel may be trimmed to.
+///
+/// The panel has to be rectangular, so every series is cut to the shortest one
+/// — and a surface's history is essentially always shorter than a price
+/// history, because options data starts later than equity data. Trimming is
+/// therefore normal rather than exceptional; this is the floor below which the
+/// covariance stops meaning anything.
+pub const MIN_FACTOR_OBSERVATIONS: usize = 60;
+
 /// Trading days per year, for aging an option across a `VaR` horizon.
 ///
 /// `horizon_days` is a count of trading days — that is what makes `sqrt(d)`
@@ -484,12 +498,9 @@ fn gather_assets(
                 let strike = kind.strike_f64().unwrap_or(0.0);
                 let tte = kind.year_fraction(as_of).unwrap_or(0.0);
                 let multiplier = kind.multiplier().to_f64().unwrap_or(1.0);
-                let snapshot = surfaces.surface(underlying, as_of).ok_or(
-                    RiskError::Price(crate::price::PriceError::PriceUnavailable {
-                        instrument: *inst_id,
-                        date: as_of,
-                    }),
-                )?;
+                let snapshot = surfaces
+                    .surface(underlying, as_of)
+                    .ok_or(RiskError::SurfaceUnavailable(*inst_id))?;
                 let per_contract = snapshot
                     .price_contract(right, strike, tte, 1.0, &[])
                     .ok_or(RiskError::Price(
@@ -574,9 +585,7 @@ fn build_factor_matrix(
                 returns.push((p_t / p_prev).ln());
             }
         }
-        // Trim to a common length so every factor series lines up by position.
-        let start = returns.len() - need;
-        matrix.push(returns[start..].to_vec());
+        matrix.push(returns);
     }
 
     // Volatility factors, appended per driver that has a surface.
@@ -584,19 +593,32 @@ fn build_factor_matrix(
     for driver in drivers {
         let Some(snapshot) = surfaces.surface(*driver, as_of) else { continue };
         let scores = &snapshot.pca.scores;
-        if scores.len() < need {
-            return Err(RiskError::InsufficientHistory(
-                *driver,
-                lookback,
-                scores.len(),
-            ));
-        }
         let k = snapshot.pca.components();
         score_index.insert(*driver, (matrix.len(), k));
-        let start = scores.len() - need;
         for j in 0..k {
-            matrix.push(scores[start..].iter().map(|row| row[j]).collect());
+            matrix.push(scores.iter().map(|row| row[j]).collect());
         }
+    }
+
+    // Rectangularise on the shortest series, keeping the most recent
+    // observations. Aligning on the tail rather than the head matters: the
+    // series must describe the *same* days, and they all end at `as_of`.
+    let common = matrix.iter().map(Vec::len).min().unwrap_or(0);
+    if common < MIN_FACTOR_OBSERVATIONS.min(need) {
+        let culprit = drivers
+            .iter()
+            .copied()
+            .next()
+            .unwrap_or_else(InstrumentId::new);
+        return Err(RiskError::InsufficientHistory(
+            culprit,
+            u32::try_from(MIN_FACTOR_OBSERVATIONS).unwrap_or(u32::MAX),
+            common,
+        ));
+    }
+    for series in &mut matrix {
+        let start = series.len() - common;
+        series.drain(..start);
     }
 
     for asset in assets.iter_mut() {
@@ -1145,7 +1167,7 @@ mod tests {
         }
 
         /// The whole chain against a closed form. The synthetic history has a
-        /// known daily sigma, so a naked stock's one-day 95% VaR must land on
+        /// known daily sigma, so a naked stock's one-day 95% `VaR` must land on
         /// `1.645 * sigma * value` — if forwards, surfaces or factor plumbing
         /// were mis-scaled, this is where it would show.
         #[test]
