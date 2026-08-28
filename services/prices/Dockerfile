@@ -5,7 +5,8 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 RUN uv pip install --system --no-cache \
-    fastapi uvicorn yfinance duckdb pandas
+    fastapi uvicorn yfinance duckdb pandas \
+    'psycopg[binary]' exchange-calendars
 
 COPY server.py ./
 ENV PRICES_DATA=/data

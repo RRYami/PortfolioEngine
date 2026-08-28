@@ -121,6 +121,9 @@ def _is_fresh(con, symbol: str) -> bool:
 # series would reject perfectly good rows.
 _CALENDAR_QUORUM = 200
 
+# Venue whose sessions define a trading day. Matches market.trading_day.
+CALENDAR = "XNYS"
+
 
 def _drop_non_trading_days(con, symbol: str, recs: list) -> tuple[list, list]:
     """Split `recs` into rows on known trading days and rows on closed days.
@@ -287,6 +290,68 @@ def fetch_fx(con, period: str = FX_PERIOD, force: bool = False) -> dict:
     return out
 
 
+def sync_postgres(con) -> dict:
+    """Mirror closes and rates into Postgres, if a database is configured.
+
+    The API reads `market.equity_close`; without this a fetch would land in
+    DuckDB and the served numbers would quietly stay stale until someone ran
+    the backfill by hand.
+
+    Best-effort by design. A price fetch that succeeded should not be reported
+    as failed because the database is down, and DuckDB remains the record --
+    pg_backfill.py reconciles whatever was missed.
+    """
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        return {"synced": False, "reason": "DATABASE_URL unset"}
+    try:
+        import exchange_calendars as xc
+        import psycopg
+    except ImportError as e:  # pragma: no cover - image without the extras
+        return {"synced": False, "reason": f"missing dependency: {e.name}"}
+
+    closes = con.execute("SELECT symbol, date, close FROM prices").fetchall()
+    rates = con.execute("SELECT ccy, date, usd_per_unit FROM fx").fetchall()
+    if not closes:
+        return {"synced": False, "reason": "no rows"}
+
+    # Extend the session calendar to cover what is being written. Sourced from
+    # the exchange, never inferred from the prices themselves: a calendar
+    # derived from observed dates would authorise exactly the bad rows the
+    # foreign key exists to reject.
+    lo, hi = min(r[1] for r in closes), max(r[1] for r in closes)
+    cal = xc.get_calendar(CALENDAR)
+    lo = max(lo, cal.first_session.date())
+    hi = min(hi, cal.last_session.date())
+    sessions = [(d.date(), CALENDAR) for d in cal.sessions_in_range(lo, hi)]
+
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO market.trading_day (session_date, venue) "
+                    "VALUES (%s, %s) ON CONFLICT (session_date) DO NOTHING",
+                    sessions,
+                )
+                cur.executemany(
+                    "INSERT INTO market.equity_close (symbol, session_date, close) "
+                    "VALUES (%s, %s, %s) ON CONFLICT (symbol, session_date) "
+                    "DO UPDATE SET close = EXCLUDED.close",
+                    closes,
+                )
+                cur.executemany(
+                    "INSERT INTO market.fx_rate (ccy, rate_date, usd_per_unit) "
+                    "VALUES (%s, %s, %s) ON CONFLICT (ccy, rate_date) "
+                    "DO UPDATE SET usd_per_unit = EXCLUDED.usd_per_unit",
+                    rates,
+                )
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        log.warning("postgres sync failed: %s", e)
+        return {"synced": False, "reason": str(e)}
+    return {"synced": True, "closes": len(closes), "fx": len(rates)}
+
+
 def export(con) -> None:
     con.execute(
         f"""COPY (SELECT symbol, strftime(date, '%Y-%m-%d') AS date, close
@@ -318,6 +383,7 @@ def ensure(req: EnsureReq) -> dict:
                 symbols[sym] = {"error": str(e)}
         fx = fetch_fx(con, force=req.force)
         export(con)
+        pg = sync_postgres(con)
     finally:
         con.close()
-    return {"symbols": symbols, "fx": fx}
+    return {"symbols": symbols, "fx": fx, "postgres": pg}

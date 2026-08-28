@@ -22,6 +22,15 @@ services:
     build: ./services/prices
     ports:
       - "8001:8001"
+    environment:
+      # Optional. When set, fetched closes and rates are written to
+      # market.equity_close / market.fx_rate as well as DuckDB, so the API's
+      # Postgres source sees them without a manual backfill. Unset, the
+      # service behaves exactly as before.
+      DATABASE_URL: postgres://ptf:ptf@postgres:5432/ptf_engine
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       # Bind-mounted rather than a named volume so the host and the containers
       # share one directory. The option pipeline runs on the host -- the
