@@ -303,6 +303,7 @@ mod tests {
             Arc::new(SyntheticPriceSource),
             None,
             registration_open,
+            None,
         );
         let backend = Backend::new(users);
         handlers::router(state).layer(auth_layer(

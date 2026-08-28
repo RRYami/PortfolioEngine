@@ -145,6 +145,7 @@ async fn main() {
         prices,
         prices_url,
         registration_open,
+        storage.pool.clone(),
     );
     let backend = auth::Backend::new(storage.users);
     let router = handlers::router(state);

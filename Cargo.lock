@@ -2193,6 +2193,7 @@ dependencies = [
  "ptf-engine",
  "sqlx",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

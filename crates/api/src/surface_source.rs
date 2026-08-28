@@ -405,3 +405,201 @@ mod tests {
         );
     }
 }
+
+/// Load surfaces from `vol.*`, each root pinned to whatever `vol.current_run`
+/// points at.
+///
+/// Reading through the pointer rather than "whatever is on disk" is the point:
+/// a build in progress writes a new run that nobody sees until it commits and
+/// promotes, and rolling back a bad fit is an update to one row rather than
+/// regenerating six files.
+pub async fn load_postgres(
+    pool: &sqlx::PgPool,
+    roots: &HashMap<String, InstrumentId>,
+    as_of: NaiveDate,
+) -> StaticVolSurfaceProvider {
+    let mut provider = StaticVolSurfaceProvider::new();
+    for (root, id) in roots {
+        match load_root(pool, root, as_of).await {
+            Ok(Some(snapshot)) => provider.insert(*id, snapshot),
+            // A root with no fitted surface is normal -- most holdings are
+            // equities. A query failure is not, so it is worth saying so
+            // rather than silently serving an empty provider.
+            Ok(None) => {}
+            Err(e) => tracing::warn!("surface for {root}: {e}"),
+        }
+    }
+    provider
+}
+
+async fn load_root(
+    pool: &sqlx::PgPool,
+    root: &str,
+    as_of: NaiveDate,
+) -> Result<Option<SurfaceSnapshot>, sqlx::Error> {
+    use sqlx::Row;
+
+    let Some(run) = sqlx::query("SELECT run_id FROM vol.current_run WHERE root = $1")
+        .bind(root)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let run_id: uuid::Uuid = run.get("run_id");
+
+    // Latest session at or before the report date: a report dated today must
+    // not read a surface fitted from tomorrow's quotes.
+    let Some(session) = sqlx::query(
+        "SELECT max(quote_date) AS session FROM vol.svi_slice
+         WHERE run_id = $1 AND quote_date <= $2",
+    )
+    .bind(run_id)
+    .bind(as_of)
+    .fetch_one(pool)
+    .await?
+    .get::<Option<NaiveDate>, _>("session") else {
+        return Ok(None);
+    };
+
+    let slices: Vec<FittedSlice> = sqlx::query(
+        "SELECT tte, a, b, rho, m, sigma, k_lo, k_hi FROM vol.svi_slice
+         WHERE run_id = $1 AND quote_date = $2 ORDER BY tte",
+    )
+    .bind(run_id)
+    .bind(session)
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(|r| FittedSlice {
+        tte: r.get("tte"),
+        svi: Svi {
+            a: r.get("a"),
+            b: r.get("b"),
+            rho: r.get("rho"),
+            m: r.get("m"),
+            sigma: r.get("sigma"),
+        },
+        k_lo: r.get("k_lo"),
+        k_hi: r.get("k_hi"),
+    })
+    .collect();
+    if slices.len() < 2 {
+        return Ok(None);
+    }
+
+    let fwd_rows = sqlx::query(
+        "SELECT tte, forward, curve_rate FROM vol.forward_curve
+         WHERE run_id = $1 AND quote_date = $2 ORDER BY tte",
+    )
+    .bind(run_id)
+    .bind(session)
+    .fetch_all(pool)
+    .await?;
+    if fwd_rows.is_empty() {
+        return Ok(None);
+    }
+    let rate: f64 = fwd_rows.last().map_or(0.0, |r| r.get("curve_rate"));
+    let forwards: Vec<(f64, f64)> = fwd_rows
+        .iter()
+        .map(|r| (r.get("tte"), r.get("forward")))
+        .collect();
+
+    let Some((cells, pca, score_sessions)) = read_factors_pg(pool, run_id).await? else {
+        return Ok(None);
+    };
+
+    Ok(Some(SurfaceSnapshot {
+        forwards,
+        rate,
+        slices,
+        cells,
+        pca,
+        score_sessions,
+    }))
+}
+
+/// Loadings define the cell order, and the scores must be read in the same
+/// component order or the factors would be silently transposed.
+#[allow(clippy::type_complexity)]
+async fn read_factors_pg(
+    pool: &sqlx::PgPool,
+    run_id: uuid::Uuid,
+) -> Result<Option<(Vec<Cell>, PcaFit, Vec<NaiveDate>)>, sqlx::Error> {
+    use sqlx::Row;
+
+    let load_rows = sqlx::query(
+        "SELECT pc, z, tte, loading, cell_mean, cell_sd, explained
+         FROM vol.pca_loading WHERE run_id = $1 ORDER BY pc, z, tte",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    if load_rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut cells: Vec<Cell> = Vec::new();
+    let mut mean = Vec::new();
+    let mut sd = Vec::new();
+    let mut loadings: Vec<Vec<f64>> = Vec::new();
+    let mut explained: Vec<f64> = Vec::new();
+    for r in &load_rows {
+        let pc: i32 = r.get("pc");
+        let idx = usize::try_from(pc - 1).unwrap_or(0);
+        if loadings.len() <= idx {
+            loadings.resize(idx + 1, Vec::new());
+            explained.resize(idx + 1, 0.0);
+        }
+        explained[idx] = r.get("explained");
+        loadings[idx].push(r.get("loading"));
+        if pc == 1 {
+            cells.push(Cell { z: r.get("z"), tte: r.get("tte") });
+            mean.push(r.get("cell_mean"));
+            sd.push(r.get("cell_sd"));
+        }
+    }
+    if loadings.iter().any(|v| v.len() != cells.len()) {
+        return Ok(None);
+    }
+
+    let score_rows = sqlx::query(
+        "SELECT quote_date, pc, score FROM vol.pca_score
+         WHERE run_id = $1 ORDER BY quote_date, pc",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+
+    let k = loadings.len();
+    let mut scores: Vec<Vec<f64>> = Vec::new();
+    let mut score_sessions: Vec<NaiveDate> = Vec::new();
+    let mut current: Option<NaiveDate> = None;
+    let mut row: Vec<f64> = Vec::new();
+    for r in &score_rows {
+        let d: NaiveDate = r.get("quote_date");
+        if current != Some(d) {
+            // Only complete rows: a session missing a component would shift
+            // every later factor by one column.
+            if current.is_some() && row.len() == k {
+                scores.push(std::mem::take(&mut row));
+                score_sessions.push(current.unwrap_or(d));
+            }
+            row.clear();
+            current = Some(d);
+        }
+        row.push(r.get("score"));
+    }
+    if row.len() == k {
+        if let Some(d) = current {
+            scores.push(row);
+            score_sessions.push(d);
+        }
+    }
+
+    Ok(Some((
+        cells,
+        PcaFit { mean, sd, loadings, explained, scores },
+        score_sessions,
+    )))
+}

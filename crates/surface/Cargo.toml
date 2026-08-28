@@ -15,6 +15,7 @@ arrow = "54"
 parquet = "54"
 chrono = { workspace = true }
 sqlx = { workspace = true }
+uuid = { workspace = true }
 # A batch CLI, so the runtime exists only to drive the query; the pipeline
 # itself stays synchronous.
 tokio = { version = "1", features = ["rt-multi-thread"] }

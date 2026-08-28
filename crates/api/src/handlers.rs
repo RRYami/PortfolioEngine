@@ -317,7 +317,7 @@ async fn add_option(
             missing.join(", ")
         )));
     }
-    let surfaces = crate::surface_source::load(&files, &roots, Utc::now().date_naive());
+    let surfaces = load_surfaces(&app, &roots, Utc::now().date_naive()).await;
     if surfaces.is_empty() {
         return Err(ApiError::BadRequest(format!(
             "surface artifacts in {} contain no fitted surface for {} — ingest its \
@@ -643,7 +643,7 @@ async fn build_prices(
         .cloned()
         .collect();
     let mut pd = app.prices.build(&feed, base, as_of, lookback).await?;
-    let surfaces = mark_options(holdings, &mut pd, as_of);
+    let surfaces = mark_options(app, holdings, &mut pd, as_of).await;
     Ok((pd, surfaces))
 }
 
@@ -655,7 +655,24 @@ async fn build_prices(
 /// `PriceProvider`, so they cannot disagree about what an option is worth. The
 /// mark is the same model that revalues it on every simulated path, so a
 /// reported P&L is risk rather than risk plus a mark-to-model gap.
-fn mark_options(
+/// Fitted surfaces from `vol.*` when a database is configured, else from the
+/// parquet artifacts. The database is pinned to `vol.current_run`, so a build
+/// in progress cannot be read half-finished.
+async fn load_surfaces(
+    app: &AppState,
+    roots: &HashMap<String, InstrumentId>,
+    as_of: chrono::NaiveDate,
+) -> ptf_engine::StaticVolSurfaceProvider {
+    if let Some(pool) = app.pool.as_ref() {
+        return crate::surface_source::load_postgres(pool, roots, as_of).await;
+    }
+    let dir = std::env::var("PTF_SURFACES").unwrap_or_else(|_| "services/prices/data".into());
+    let files = crate::surface_source::SurfaceFiles::in_dir(std::path::Path::new(&dir));
+    crate::surface_source::load(&files, roots, as_of)
+}
+
+async fn mark_options(
+    app: &AppState,
     holdings: &[HeldInstrument],
     pd: &mut crate::price_source::PriceData,
     as_of: chrono::NaiveDate,
@@ -668,9 +685,7 @@ fn mark_options(
         .filter(|h| !h.kind.is_derivative())
         .map(|h| (h.symbol.clone(), h.id))
         .collect();
-    let dir = std::env::var("PTF_SURFACES").unwrap_or_else(|_| "services/prices/data".into());
-    let files = crate::surface_source::SurfaceFiles::in_dir(std::path::Path::new(&dir));
-    let surfaces = crate::surface_source::load(&files, &roots, as_of);
+    let surfaces = load_surfaces(app, &roots, as_of).await;
 
     for h in holdings.iter().filter(|h| h.kind.is_derivative()) {
         let InstrumentKind::EquityOption { underlying, right, .. } = h.kind else { continue };

@@ -20,6 +20,7 @@ mod build;
 mod error;
 mod factors;
 mod quotes;
+mod publish;
 mod write;
 
 use std::path::PathBuf;
@@ -126,6 +127,25 @@ fn run() -> Result<(), error::SurfaceError> {
     let score_path = out.join("vol_pca_scores.parquet");
     write::pca_loadings(&load_path, &fits)?;
     write::pca_scores(&score_path, &fits)?;
+
+    // Publish last, once every artifact is in hand. A run becomes visible to
+    // the API only when its own transaction commits, so a build that dies
+    // partway leaves the previous fit serving rather than a half-written one.
+    if let Ok(dsn) = std::env::var("DATABASE_URL") {
+        if !args.iter().any(|a| a == "--no-publish") {
+            let config = format!(
+                "{{\"components\":{},\"sessions\":{},\"quotes\":{}}}",
+                fits.first().map_or(0, |f| f.fit.components()),
+                chain.len(),
+                quotes_in
+            );
+            for (root, id) in
+                publish::publish(&dsn, &forwards, &ivs, &svis, &grid, &fits, &config)?
+            {
+                eprintln!("published {root} as run {id} (now current)");
+            }
+        }
+    }
 
     let arb = svis.iter().filter(|s| s.min_durrleman < 0.0).count();
     let worst = svis.iter().map(|s| s.rmse_vol).fold(0.0_f64, f64::max);

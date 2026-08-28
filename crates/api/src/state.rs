@@ -26,6 +26,9 @@ pub struct AppState {
     /// benchmark on the performance tab) would otherwise make a cross-service
     /// round trip on every request; writes bypass this and always ensure.
     pub ensured: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Present only with `DATABASE_URL`. Read paths use it for the fitted
+    /// surfaces, which live in `vol.*`; without it they fall back to parquet.
+    pub pool: Option<sqlx::PgPool>,
 }
 
 /// How long an ensure is considered good for on a read path. Prices move
@@ -34,6 +37,9 @@ pub struct AppState {
 pub const ENSURE_TTL: std::time::Duration = std::time::Duration::from_secs(900);
 
 impl AppState {
+    // One argument per collaborator, all of them required. Bundling them into
+    // a config struct would just move the same list somewhere else.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         portfolios: Arc<dyn PortfolioRepository>,
         transactions: Arc<dyn TransactionRepository>,
@@ -42,6 +48,7 @@ impl AppState {
         prices: Arc<dyn PriceSource>,
         prices_url: Option<String>,
         registration_open: bool,
+        pool: Option<sqlx::PgPool>,
     ) -> Self {
         Self {
             portfolios,
@@ -52,6 +59,7 @@ impl AppState {
             prices_url,
             registration_open,
             ensured: Arc::new(Mutex::new(HashMap::new())),
+            pool,
         }
     }
 }
