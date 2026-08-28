@@ -234,12 +234,16 @@ fn parse_exercise(s: Option<&str>) -> Result<ExerciseStyle, ApiError> {
 
 /// Buy a listed option.
 ///
+/// Long, because most of it is validation: an option has five contract terms
+/// that each have a way of being wrong, and each deserves its own message.
+///
 /// Mirrors [`add_holding`]'s deposit-then-buy desugaring, with two differences
 /// that matter. The instrument is registered with its full contract terms, so
 /// the risk engine can revalue it through a surface instead of shocking it like
 /// a stock. And the underlying is registered and price-ensured too, because an
 /// option is priced as a function of its underlying and the risk run needs that
 /// history whether or not the underlying is itself held.
+#[allow(clippy::too_many_lines)]
 async fn add_option(
     user: SessionUser,
     State(app): State<AppState>,
@@ -300,11 +304,25 @@ async fn add_option(
     let dir = std::env::var("PTF_SURFACES").unwrap_or_else(|_| "services/prices/data".into());
     let files = crate::surface_source::SurfaceFiles::in_dir(std::path::Path::new(&dir));
     let roots = HashMap::from([(req.underlying.clone(), underlying_id)]);
+    let missing = files.missing();
+    if !missing.is_empty() {
+        // The files are absent, which is a different problem from this
+        // underlying not being fitted: naming the directory turns a puzzling
+        // message into an obvious one when the API is running somewhere the
+        // relative default does not resolve, such as a container.
+        return Err(ApiError::BadRequest(format!(
+            "no surface artifacts in {} (missing: {}) — run ptf-surface, or point \
+             PTF_SURFACES at the directory holding them",
+            files.search_dir(),
+            missing.join(", ")
+        )));
+    }
     let surfaces = crate::surface_source::load(&files, &roots, Utc::now().date_naive());
     if surfaces.is_empty() {
         return Err(ApiError::BadRequest(format!(
-            "no fitted volatility surface for {} — build it with ptf-surface before \
-             holding options on this underlying",
+            "surface artifacts in {} contain no fitted surface for {} — ingest its \
+             option chains and re-run ptf-surface",
+            files.search_dir(),
             req.underlying
         )));
     }

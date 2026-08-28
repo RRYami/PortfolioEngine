@@ -23,7 +23,13 @@ services:
     ports:
       - "8001:8001"
     volumes:
-      - pricedata:/data
+      # Bind-mounted rather than a named volume so the host and the containers
+      # share one directory. The option pipeline runs on the host -- the
+      # Databento ingest and `ptf-surface` both write here -- and with a managed
+      # volume none of that output was reachable from inside a container, so
+      # holding an option was impossible under compose however the API was
+      # configured.
+      - ./services/prices/data:/data
 
   # Rust analytics engine API. Reads the Parquet snapshot from the shared
   # volume and calls the prices service over the network for ensure-on-add.
@@ -36,12 +42,17 @@ services:
       PRICES_URL: http://prices:8001
       PRICES_PARQUET: /data/prices.parquet
       FX_PARQUET: /data/fx.parquet
+      # Surface artifacts live beside the price snapshot on the shared volume.
+      # Without this the API falls back to a path relative to its working
+      # directory, which does not exist in the container, and every option add
+      # fails as though the surface had never been built.
+      PTF_SURFACES: /data
       PTF_API_ADDR: 0.0.0.0:8080
       DATABASE_URL: postgres://ptf:ptf@postgres:5432/ptf_engine
     ports:
       - "8080:8080"
     volumes:
-      - pricedata:/data:ro
+      - ./services/prices/data:/data:ro
     depends_on:
       prices:
         condition: service_healthy
@@ -72,4 +83,3 @@ services:
 
 volumes:
   pgdata:
-  pricedata:

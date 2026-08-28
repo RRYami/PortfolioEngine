@@ -45,9 +45,40 @@ impl SurfaceFiles {
 
     #[must_use]
     pub fn all_present(&self) -> bool {
+        self.missing().is_empty()
+    }
+
+    /// Which of the four artifacts cannot be found.
+    ///
+    /// Reported rather than collapsed into a boolean because "no surface for
+    /// this underlying" and "the surface files are not where the API is
+    /// looking" need completely different fixes, and the second is the one a
+    /// relative default path produces when the process runs from an unexpected
+    /// directory or inside a container.
+    #[must_use]
+    pub fn missing(&self) -> Vec<String> {
         [&self.params, &self.forwards, &self.loadings, &self.scores]
             .iter()
-            .all(|p| p.exists())
+            .filter(|p| !p.exists())
+            .map(|p| p.display().to_string())
+            .collect()
+    }
+
+    /// The directory being searched, resolved against the working directory so
+    /// a relative default is legible in an error message.
+    #[must_use]
+    pub fn search_dir(&self) -> String {
+        self.params
+            .parent()
+            .map(|d| {
+                std::fs::canonicalize(d)
+                    .unwrap_or_else(|_| {
+                        std::env::current_dir().unwrap_or_default().join(d)
+                    })
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_default()
     }
 }
 

@@ -16,8 +16,11 @@ make down    # stop
 
 Services (see `docker-compose.yml`): `frontend` (:3000) → `api` (:8080) →
 `prices` (:8001), plus `postgres` (:5433, TimescaleDB). The `api` and `prices`
-containers share the `pricedata` volume — `prices` writes the Parquet snapshot,
-`api` reads it; they also talk over the network for ensure-on-add. Portfolios,
+containers bind-mount `services/prices/data` — `prices` writes the Parquet
+snapshot, `api` reads it; they also talk over the network for ensure-on-add. A
+bind mount rather than a named volume because the option pipeline runs on the
+host: the Databento ingest and `ptf-surface` both write there, and a managed
+volume would put their output somewhere no container could reach. Portfolios,
 instruments, transactions, users, and sessions are stored durably in Postgres
 (the `pgdata` volume); the API applies embedded migrations on boot. The app
 requires an account: register in the UI (first user or anyone, unless
@@ -152,8 +155,9 @@ DATABASE_URL=postgres://ptf:ptf@localhost:5433/ptf_engine cargo run -p ptf-api
 
 # Auth env flags: PTF_DISABLE_REGISTRATION=1 (close sign-up),
 # PTF_SECURE_COOKIES=1 (Secure cookie flag — enable behind TLS)
-# Options: PTF_SURFACES=<dir> where the surface artifacts live
-# (default services/prices/data)
+# Options: PTF_SURFACES=<dir> where the surface artifacts live (default
+# services/prices/data, resolved against the working directory — set it
+# explicitly if the API runs from anywhere else)
 
 # Ingest option chains (costs money; --preview-cost prices a day first)
 export DATABENTO_API_KEY=...   # or: set -a; source .env.local; set +a
