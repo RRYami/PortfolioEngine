@@ -20,6 +20,7 @@ use rust_decimal::Decimal;
 use crate::error::ApiError;
 
 /// A held instrument that needs price data.
+#[derive(Clone)]
 pub struct HeldInstrument {
     pub id: InstrumentId,
     pub symbol: String,

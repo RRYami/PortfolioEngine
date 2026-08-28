@@ -429,10 +429,8 @@ async fn get_risk(
 
     let as_of = Utc::now().date_naive();
     let lookback = ptf_engine::MonteCarloConfig::default_var().lookback_days;
-    let mut pd = app
-        .prices
-        .build(&holdings, portfolio.base_currency, as_of, lookback)?;
-    let surfaces = mark_options(&holdings, &mut pd, as_of);
+    let (pd, surfaces) =
+        build_prices(&app, &holdings, portfolio.base_currency, as_of, lookback)?;
     let payload =
         risk_view::build(&portfolio, &state, &holdings, &names, &pd, &surfaces, as_of)?;
     Ok(Json(payload))
@@ -452,11 +450,8 @@ async fn get_positions(
     // Positions only need spot + FX; reuse the same lookback so parquet/synthetic
     // sources have a valid window to source the latest close from.
     let lookback = ptf_engine::MonteCarloConfig::default_var().lookback_days;
-    let mut pd = app
-        .prices
-        .build(&holdings, portfolio.base_currency, as_of, lookback)?;
-    // Options have no price feed of their own; they are marked from the surface.
-    let _ = mark_options(&holdings, &mut pd, as_of);
+    let (pd, _surfaces) =
+        build_prices(&app, &holdings, portfolio.base_currency, as_of, lookback)?;
     let payload = positions_view::build(&portfolio, &state, &holdings, &names, &pd, as_of)?;
     Ok(Json(payload))
 }
@@ -482,9 +477,10 @@ async fn get_performance(
 
     let as_of = Utc::now().date_naive();
     let lookback = ptf_engine::MonteCarloConfig::default_var().lookback_days;
-    let pd = app
-        .prices
-        .build(&holdings, portfolio.base_currency, as_of, lookback)?;
+    // Options are marked from the surface here too, so the performance page
+    // values the same book the positions page does.
+    let (pd, _surfaces) =
+        build_prices(&app, &holdings, portfolio.base_currency, as_of, lookback)?;
 
     // Benchmark is best-effort: if it can't be fetched/priced we still return the
     // self-contained ratios, just without the `relative` block.
@@ -608,6 +604,29 @@ async fn gather_holdings(
         }
     }
     (holdings, names)
+}
+
+/// Build the price data for a book, marking any options from their surface.
+///
+/// Options are filtered out of the feed request rather than passed to it: a
+/// listed contract has no row in the price file and never will, so asking for
+/// one is an error by construction. Their underlyings are still in the list,
+/// which is what the risk run actually needs.
+fn build_prices(
+    app: &AppState,
+    holdings: &[HeldInstrument],
+    base: Currency,
+    as_of: chrono::NaiveDate,
+    lookback: u32,
+) -> Result<(crate::price_source::PriceData, ptf_engine::StaticVolSurfaceProvider), ApiError> {
+    let feed: Vec<HeldInstrument> = holdings
+        .iter()
+        .filter(|h| !h.kind.is_derivative())
+        .cloned()
+        .collect();
+    let mut pd = app.prices.build(&feed, base, as_of, lookback)?;
+    let surfaces = mark_options(holdings, &mut pd, as_of);
+    Ok((pd, surfaces))
 }
 
 /// Load the fitted surfaces for whatever underlyings this book needs, and mark
