@@ -824,8 +824,9 @@ export default function RiskDashboard({
                             style={{
                               height: "100%",
                               borderRadius: 5,
-                              background:
-                                "linear-gradient(90deg,var(--loss),var(--lossDeep))",
+                              background: c.hedge
+                                ? "linear-gradient(90deg,var(--gain),#059669)"
+                                : "linear-gradient(90deg,var(--loss),var(--lossDeep))",
                               width: `${c.barPct}%`,
                             }}
                           />

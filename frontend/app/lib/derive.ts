@@ -35,6 +35,8 @@ export interface CompRow {
   valueL: string;
   pctL: string;
   barPct: number;
+  /** Contributes negatively — a hedge, offsetting risk rather than adding it. */
+  hedge: boolean;
 }
 
 export interface DerivedView {
@@ -169,12 +171,18 @@ export function derive(payload: RiskPayload, conf: Confidence): DerivedView {
   }));
 
   // ---- Component VaR ----
-  const maxValue = r.componentVar[0]?.value ?? 1;
+  // Scaled on the largest *magnitude*, because a contribution can be negative:
+  // a hedge makes money on the paths where the book loses most, so it takes
+  // risk away. Bars are drawn by magnitude and coloured by sign; a negative
+  // width is not a width at all.
+  const maxAbs =
+    r.componentVar.reduce((m, c) => Math.max(m, Math.abs(c.value)), 0) || 1;
   const comps: CompRow[] = r.componentVar.map((c) => ({
     t: c.ticker,
     valueL: comp(c.value, bc),
     pctL: c.pctOfVar + "%",
-    barPct: round1((c.value / maxValue) * 100),
+    barPct: round1((Math.abs(c.value) / maxAbs) * 100),
+    hedge: c.value < 0,
   }));
 
   // ---- P&L distribution histogram ----

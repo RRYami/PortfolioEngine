@@ -377,12 +377,19 @@ pub fn compute_var(
                 Decimal::from_f64(s_var.max(0.0)).unwrap_or(Decimal::ZERO),
                 base,
             ),
+            // Deliberately *not* clamped at zero. A hedge contributes
+            // negatively: on the paths where the book loses most, a protective
+            // put is making money, so its share of the tail loss is below zero.
+            // Flooring it reported the hedge as contributing nothing and handed
+            // the position it was hedging 100% of the risk — and it broke the
+            // property that makes a component decomposition worth having, that
+            // the parts sum to the whole.
             component_cvar: Money::new(
-                Decimal::from_f64(component.max(0.0)).unwrap_or(Decimal::ZERO),
+                Decimal::from_f64(component).unwrap_or(Decimal::ZERO),
                 base,
             ),
             incremental_cvar: Money::new(
-                Decimal::from_f64(component.max(0.0)).unwrap_or(Decimal::ZERO),
+                Decimal::from_f64(component).unwrap_or(Decimal::ZERO),
                 base,
             ),
         });
@@ -1213,6 +1220,61 @@ mod tests {
             eprintln!("protective put (long 0.95P):   VaR {pp:.2}  ({:+.1}% vs naked)", 100.0 * (pp / got - 1.0));
             eprintln!("long 5x 1.20C (45d):          premium {paid:.2}, VaR {long_call:.2}");
             assert!(cc < got && pp < got);
+        }
+
+        /// A hedge must show up as a hedge in the decomposition.
+        #[test]
+        fn a_protective_put_contributes_negatively() {
+            let mut w = world();
+            w.add_stock(100);
+            let put = w.add_option(OptionRight::Put, 0.95, 1, 60);
+            let report = w.run();
+
+            let leg = |id| {
+                report
+                    .per_asset
+                    .iter()
+                    .find(|a| a.instrument == id)
+                    .unwrap()
+                    .component_cvar
+                    .amount
+                    .to_f64()
+                    .unwrap()
+            };
+            let stock = leg(w.under);
+            let hedge = leg(put);
+            assert!(stock > 0.0, "the stock drives the tail: {stock:.2}");
+            assert!(
+                hedge < 0.0,
+                "the put makes money on the paths where the book loses most, so its \
+                 contribution must be negative, got {hedge:.2}"
+            );
+            // And the hedge must be big enough to matter, not a rounding wobble.
+            assert!(
+                hedge.abs() > 0.02 * stock,
+                "hedge {hedge:.2} is negligible against {stock:.2}"
+            );
+        }
+
+        /// The property that makes a component decomposition worth having.
+        #[test]
+        fn components_sum_to_the_portfolio_tail_loss() {
+            let mut w = world();
+            w.add_stock(100);
+            w.add_option(OptionRight::Put, 0.95, 1, 60);
+            w.add_option(OptionRight::Call, 1.05, 2, 45);
+            let report = w.run();
+
+            let parts: f64 = report
+                .per_asset
+                .iter()
+                .map(|a| a.component_cvar.amount.to_f64().unwrap())
+                .sum();
+            let whole = report.entries[0].portfolio_cvar.amount.to_f64().unwrap();
+            assert!(
+                (parts - whole).abs() < 1e-6 * whole.abs().max(1.0),
+                "components sum to {parts:.4} but the portfolio CVaR is {whole:.4}"
+            );
         }
 
         #[test]
